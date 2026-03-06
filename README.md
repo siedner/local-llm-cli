@@ -1,0 +1,220 @@
+# local-llm
+
+CLI tool to manage and run local LLMs using **MLX-LM** on macOS Apple Silicon.
+
+Designed for:
+- **MacBook Pro M1 Pro, 32GB RAM**
+- **Mac mini M4, 16GB RAM**
+
+## Install
+
+```bash
+# Option 1: pipx (recommended)
+pipx install .
+
+# Option 2: pip
+pip install .
+```
+
+## Quick start
+
+```bash
+# Check your environment
+local-llm doctor
+
+# Auto-detect your hardware profile
+local-llm profile auto
+
+# Download a model
+local-llm models install RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4
+
+# Start a chat
+local-llm chat RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4
+
+# Start a server (foreground)
+local-llm serve start RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4
+
+# Start a server (background)
+local-llm serve start RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4 --detach
+```
+
+## Commands
+
+### Doctor
+
+Check environment and install missing prerequisites:
+
+```bash
+local-llm doctor
+```
+
+Example output:
+```
+  [OK] python3: Python 3.12.0 at /opt/homebrew/bin/python3
+  [OK] mlx_lm in PATH: found mlx_lm.generate at /opt/homebrew/bin/mlx_lm.generate
+  [OK] mlx_lm importable: /opt/homebrew/lib/python3.12/site-packages/mlx_lm/__init__.py
+  [OK] virtual env: none detected (system Python will be used)
+  [OK] HF cache: /Users/you/.cache/huggingface/hub
+  [OK] ssh: found at /usr/bin/ssh
+  [OK] lsof: found at /usr/sbin/lsof
+
+All checks passed.
+```
+
+Auto-fix missing dependencies:
+```bash
+local-llm doctor --fix        # interactive
+local-llm doctor --fix --yes  # auto-confirm
+```
+
+### Profiles
+
+```bash
+local-llm profile list      # show available profiles
+local-llm profile current   # show active profile
+local-llm profile auto      # auto-detect from hardware
+local-llm profile set m4mini16  # manual override
+```
+
+### Models
+
+```bash
+local-llm models list              # list installed models
+local-llm models list --disk       # with disk usage
+local-llm models list --json       # JSON output
+local-llm models recommended       # show recommended models
+
+local-llm models install RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4
+local-llm models remove RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4
+```
+
+### Chat
+
+```bash
+local-llm chat RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4
+local-llm chat RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4 --temp 0.5 --top-p 0.95
+```
+
+### Serve
+
+Start the MLX-LM OpenAI-compatible server:
+
+```bash
+# Foreground (default)
+local-llm serve start RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4
+
+# Background
+local-llm serve start RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4 --detach
+
+# Safe mode (reduced concurrency and token limits)
+local-llm serve start RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4 --safe
+
+# Custom port
+local-llm serve start RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4 --port 9090
+```
+
+Example output:
+```
+Profile:  m1pro32
+Model:    RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4
+Host:     127.0.0.1
+Port:     8080
+Max tkns: 2048
+Decode/Prompt concurrency: 1/1
+
+  WARNING: M1 Pro 32GB: models up to ~8B params are safe
+  WARNING: Large OpenCode contexts (>10k tokens) may cause Metal OOM with bigger models
+
+Base URL: http://127.0.0.1:8080/v1
+
+OpenCode provider snippet:
+{
+  "provider": {
+    "name": "MLX Local",
+    "type": "openai",
+    "url": "http://127.0.0.1:8080/v1",
+    "model": "RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4"
+  }
+}
+
+Starting server (Ctrl+C to stop)...
+```
+
+Manage running servers:
+```bash
+local-llm serve status              # check if server is running
+local-llm serve stop                # stop server on default port
+local-llm serve stop --port 9090    # stop server on specific port
+local-llm serve options             # show server flags and safe defaults
+```
+
+### OpenCode Integration
+
+```bash
+# Print OpenCode provider snippet
+local-llm opencode snippet RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4
+
+# Custom port and provider name
+local-llm opencode snippet RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4 --port 9090 --provider-name "My MLX"
+```
+
+### Guide
+
+```bash
+local-llm guide opencode   # best practices for MLX-LM + OpenCode
+```
+
+### SSH Tunnels (opt-in)
+
+SSH tunneling is off by default. Use it to forward a remote MLX-LM server to your local machine.
+
+```bash
+# Create a tunnel (foreground)
+local-llm ssh tunnel --to user@mac-mini.local
+
+# Create a tunnel (background)
+local-llm ssh tunnel --to user@mac-mini.local --detach
+
+# Custom ports and key
+local-llm ssh tunnel --to user@mac-mini.local \
+  --remote-port 8080 --local-port 9090 \
+  --key ~/.ssh/id_ed25519
+
+# Check tunnel status
+local-llm ssh status
+
+# Stop tunnel
+local-llm ssh stop
+
+# Print command without running
+local-llm ssh snippet --to user@mac-mini.local
+```
+
+## Configuration
+
+Config is stored at `~/.config/local-llm/config.json`.
+
+Runtime data (PIDs, logs) is stored at `~/.local/share/local-llm/`.
+
+## Recommended Models
+
+Text-only, MLX-converted models that work well on Apple Silicon:
+
+| Model | Quantization | Notes |
+|-------|-------------|-------|
+| `RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4` | MXFP4 | Recommended for 16GB machines |
+| `RepublicOfKorokke/Qwen3.5-4B-mlx-lm-nvfp4` | NVFP4 | Alternative quantization |
+
+## Development
+
+```bash
+# Install dev dependencies
+pip install -e ".[dev]"
+
+# Run tests
+pytest tests/ -v
+```
+
+## License
+
+MIT

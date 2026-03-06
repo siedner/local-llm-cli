@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(pip3 install:*)",
+      "Bash(python3:*)",
+      "Bash(PYTHONPATH=. python3:*)",
+      "Bash(grep:*)",
+      "Bash(python:*)",
+      "WebSearch",
+      "WebFetch(domain:textual.textualize.io)",
+      "WebFetch(domain:realpython.com)",
+      "Bash(find:*)"
+    ]
+  }
+}
