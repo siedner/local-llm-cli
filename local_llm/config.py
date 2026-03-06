@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 
 from .constants import (
-    CONFIG_DIR, CONFIG_FILE, DEFAULT_PRESET, DEFAULT_SYSTEM_PROMPT,
-    GENERATION_PRESETS, PROFILES,
+    CONFIG_DIR,
+    CONFIG_FILE,
+    CONFIG_SCHEMA_VERSION,
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    DEFAULT_PRESET,
+    DEFAULT_QUEUE_LIMIT,
+    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    DEFAULT_SYSTEM_PROMPT,
+    GENERATION_PRESETS,
+    PROFILES,
 )
 
 
@@ -21,8 +32,13 @@ def load_config() -> dict:
     """Load config from disk, returning defaults if missing."""
     if CONFIG_FILE.exists():
         try:
-            return json.loads(CONFIG_FILE.read_text())
+            raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                _preserve_invalid_config()
+                return _default_config()
+            return _normalize_config(raw)
         except (json.JSONDecodeError, OSError):
+            _preserve_invalid_config()
             return _default_config()
     return _default_config()
 
@@ -30,14 +46,42 @@ def load_config() -> dict:
 def save_config(config: dict) -> None:
     """Write config to disk."""
     _ensure_config_dir()
-    CONFIG_FILE.write_text(json.dumps(config, indent=2) + "\n")
+    normalized = _normalize_config(config)
+    CONFIG_FILE.write_text(json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
 
 
 def _default_config() -> dict:
     return {
+        "schema_version": CONFIG_SCHEMA_VERSION,
         "profile": None,
         "favorite_models": [],
         "generation": _default_generation_settings(),
+        "runtime": _default_runtime_settings(),
+        "session_defaults": _default_session_defaults(),
+        "tui": _default_tui_settings(),
+        "calibration": {},
+        "benchmarks": [],
+        "models": {},
+    }
+
+
+def _default_runtime_settings() -> dict:
+    return {
+        "backend": "mlx",
+        "host": DEFAULT_HOST,
+        "port": DEFAULT_PORT,
+        "queue_limit": DEFAULT_QUEUE_LIMIT,
+        "request_timeout_seconds": DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        "keep_alive_seconds": None,
+        "safe_mode": True,
+    }
+
+
+def _default_session_defaults() -> dict:
+    return {
+        "keep_alive_seconds": None,
+        "max_context": None,
+        "max_output": None,
     }
 
 
@@ -47,25 +91,169 @@ def _default_generation_settings() -> dict:
         "preset": DEFAULT_PRESET,
         "temp": preset["temp"],
         "top_p": preset["top_p"],
+        "top_k": preset["top_k"],
         "max_tokens": preset["max_tokens"],
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
     }
+
+
+def _default_tui_settings() -> dict:
+    return {
+        "show_statusline": True,
+        "statusline_fields": [
+            "state",
+            "model",
+            "profile",
+            "session",
+            "safe",
+            "memory",
+            "queue",
+            "warm",
+        ],
+        "multiline_hint_mode": "compact",
+        "vim_mode": False,
+        "history_size": 100,
+        "show_examples_in_help": True,
+    }
+
+
+def _normalize_config(config: dict) -> dict:
+    """Merge loaded config with defaults and preserve unknown keys."""
+    defaults = _default_config()
+
+    favorite_models = config.get("favorite_models", defaults["favorite_models"])
+    if not isinstance(favorite_models, list):
+        favorite_models = defaults["favorite_models"]
+
+    generation = config.get("generation", {})
+    if not isinstance(generation, dict):
+        generation = {}
+
+    runtime = config.get("runtime", {})
+    if not isinstance(runtime, dict):
+        runtime = {}
+
+    session_defaults = config.get("session_defaults", {})
+    if not isinstance(session_defaults, dict):
+        session_defaults = {}
+
+    tui = config.get("tui", {})
+    if not isinstance(tui, dict):
+        tui = {}
+
+    calibration = config.get("calibration", defaults["calibration"])
+    if not isinstance(calibration, dict):
+        calibration = defaults["calibration"]
+
+    benchmarks = config.get("benchmarks", defaults["benchmarks"])
+    if not isinstance(benchmarks, list):
+        benchmarks = defaults["benchmarks"]
+
+    models = config.get("models", defaults["models"])
+    if not isinstance(models, dict):
+        models = defaults["models"]
+
+    normalized = {**defaults, **config}
+    normalized["schema_version"] = CONFIG_SCHEMA_VERSION
+    normalized["favorite_models"] = favorite_models
+    normalized["generation"] = {**defaults["generation"], **generation}
+    normalized["runtime"] = {**defaults["runtime"], **runtime}
+    normalized["session_defaults"] = {**defaults["session_defaults"], **session_defaults}
+    normalized["tui"] = {**defaults["tui"], **tui}
+    normalized["calibration"] = calibration
+    normalized["benchmarks"] = benchmarks
+    normalized["models"] = models
+    return normalized
+
+
+def _preserve_invalid_config() -> None:
+    """Move a broken config aside so the next save does not overwrite it."""
+    if not CONFIG_FILE.exists():
+        return
+
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = CONFIG_FILE.with_name(
+        f"{CONFIG_FILE.stem}.invalid-{timestamp}{CONFIG_FILE.suffix}"
+    )
+    try:
+        shutil.move(str(CONFIG_FILE), str(backup))
+    except OSError:
+        pass
 
 
 def get_generation_settings(config: dict | None = None) -> dict:
     """Return generation settings from config, with defaults for missing keys."""
     if config is None:
         config = load_config()
-    defaults = _default_generation_settings()
-    saved = config.get("generation", {})
-    # Merge: saved values override defaults
-    return {**defaults, **saved}
+    return {**_default_generation_settings(), **config.get("generation", {})}
 
 
 def save_generation_settings(settings: dict) -> None:
     """Persist generation settings to config."""
     config = load_config()
-    config["generation"] = settings
+    config["generation"] = {
+        **_default_generation_settings(),
+        **settings,
+    }
+    save_config(config)
+
+
+def get_runtime_settings(config: dict | None = None) -> dict:
+    """Return normalized runtime settings."""
+    if config is None:
+        config = load_config()
+    return {**_default_runtime_settings(), **config.get("runtime", {})}
+
+
+def save_runtime_settings(settings: dict) -> None:
+    """Persist runtime settings to config."""
+    config = load_config()
+    config["runtime"] = {
+        **_default_runtime_settings(),
+        **settings,
+    }
+    save_config(config)
+
+
+def get_session_defaults(config: dict | None = None) -> dict:
+    """Return normalized session defaults."""
+    if config is None:
+        config = load_config()
+    return {**_default_session_defaults(), **config.get("session_defaults", {})}
+
+
+def record_benchmark(result: dict) -> None:
+    """Append a benchmark record to config."""
+    config = load_config()
+    benchmarks = list(config.get("benchmarks", []))
+    benchmarks.append(result)
+    config["benchmarks"] = benchmarks[-50:]
+    save_config(config)
+
+
+def get_tui_settings(config: dict | None = None) -> dict:
+    """Return normalized TUI settings."""
+    if config is None:
+        config = load_config()
+    return {**_default_tui_settings(), **config.get("tui", {})}
+
+
+def save_tui_settings(settings: dict) -> None:
+    """Persist TUI settings to config."""
+    config = load_config()
+    config["tui"] = {
+        **_default_tui_settings(),
+        **settings,
+    }
+    save_config(config)
+
+
+def save_calibration(profile_name: str, calibration: dict) -> None:
+    """Persist profile calibration metadata."""
+    config = load_config()
+    saved = dict(config.get("calibration", {}))
+    saved[profile_name] = calibration
+    config["calibration"] = saved
     save_config(config)
 
 
@@ -82,6 +270,42 @@ def get_profile(config: dict) -> Optional[dict]:
     return None
 
 
+def get_effective_profile(config: dict | None = None, name: str | None = None) -> tuple[str, dict]:
+    """Return the active profile name and merged settings."""
+    if config is None:
+        config = load_config()
+
+    profile_name = name or config.get("profile") or detect_profile() or "m1pro32"
+    if profile_name not in PROFILES:
+        profile_name = "m1pro32"
+
+    profile = dict(PROFILES[profile_name])
+    calibration = config.get("calibration", {}).get(profile_name, {})
+    calibrated_runtime = calibration.get("runtime", {}) if isinstance(calibration, dict) else {}
+    session_defaults = config.get("session_defaults", {})
+
+    # Resolution order is built-in defaults -> calibration -> explicit user/session overrides.
+    profile.update({k: v for k, v in calibrated_runtime.items() if k in profile})
+
+    if session_defaults.get("max_context") is not None:
+        profile["default_context"] = min(
+            profile["hard_context"],
+            int(session_defaults["max_context"]),
+        )
+    if session_defaults.get("max_output") is not None:
+        profile["max_tokens"] = min(
+            int(session_defaults["max_output"]),
+            profile["max_tokens"],
+        )
+    if session_defaults.get("keep_alive_seconds") is not None:
+        profile["keep_alive_seconds"] = int(session_defaults["keep_alive_seconds"])
+
+    profile["default_context"] = min(int(profile["default_context"]), int(profile["hard_context"]))
+    profile["max_tokens"] = min(int(profile["max_tokens"]), int(PROFILES[profile_name]["max_tokens"]))
+    profile["keep_alive_seconds"] = max(60, int(profile["keep_alive_seconds"]))
+    return profile_name, profile
+
+
 def detect_profile() -> Optional[str]:
     """Auto-detect profile by reading macOS sysctl for chip and memory."""
     chip = _detect_chip()
@@ -93,13 +317,16 @@ def detect_profile() -> Optional[str]:
 
 def match_profile(chip: str, memory_gb: int) -> Optional[str]:
     """Match a chip string and memory amount to a profile name."""
-    for name, profile in PROFILES.items():
-        pattern = profile["chip_pattern"]
-        mem = profile["memory_gb"]
-        if pattern.lower() in chip.lower() and memory_gb >= mem:
+    ordered = sorted(
+        PROFILES.items(),
+        key=lambda item: (item[1]["memory_gb"], item[0]),
+        reverse=True,
+    )
+    chip_lower = chip.lower()
+    for name, profile in ordered:
+        if profile["chip_pattern"].lower() in chip_lower and memory_gb >= profile["memory_gb"]:
             return name
-    # Fallback: match by memory alone if chip partially matches
-    for name, profile in PROFILES.items():
+    for name, profile in ordered:
         if memory_gb >= profile["memory_gb"]:
             return name
     return None

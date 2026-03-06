@@ -10,14 +10,19 @@ import pytest
 from local_llm.config import (
     _default_config,
     detect_profile,
+    get_effective_profile,
     load_config,
     match_profile,
+    get_tui_settings,
     save_config,
+    save_tui_settings,
 )
+from local_llm.constants import CONFIG_SCHEMA_VERSION
 
 
 def test_default_config():
     config = _default_config()
+    assert config["schema_version"] == CONFIG_SCHEMA_VERSION
     assert config["profile"] is None
     assert config["favorite_models"] == []
 
@@ -45,9 +50,67 @@ def test_load_config_missing(tmp_path):
 def test_load_config_invalid_json(tmp_path):
     config_file = tmp_path / "config.json"
     config_file.write_text("not json")
-    with patch("local_llm.config.CONFIG_FILE", config_file):
+    with patch("local_llm.config.CONFIG_FILE", config_file), \
+         patch("local_llm.config.CONFIG_DIR", tmp_path):
         config = load_config()
         assert config == _default_config()
+        backups = list(tmp_path.glob("config.invalid-*.json"))
+        assert len(backups) == 1
+        assert not config_file.exists()
+
+
+def test_load_config_normalizes_generation(tmp_path):
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({"generation": {"temp": 0.2}}))
+    with patch("local_llm.config.CONFIG_FILE", config_file), \
+         patch("local_llm.config.CONFIG_DIR", tmp_path):
+        config = load_config()
+        assert config["generation"]["temp"] == 0.2
+        assert "top_p" in config["generation"]
+        assert "max_tokens" in config["generation"]
+
+
+def test_load_config_normalizes_tui_settings(tmp_path):
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({"tui": {"history_size": 42}}))
+    with patch("local_llm.config.CONFIG_FILE", config_file), \
+         patch("local_llm.config.CONFIG_DIR", tmp_path):
+        config = load_config()
+        assert config["tui"]["history_size"] == 42
+        assert config["tui"]["show_statusline"] is True
+        assert "statusline_fields" in config["tui"]
+
+
+def test_save_tui_settings(tmp_path):
+    config_file = tmp_path / "config.json"
+    with patch("local_llm.config.CONFIG_FILE", config_file), \
+         patch("local_llm.config.CONFIG_DIR", tmp_path):
+        save_tui_settings({"history_size": 12, "show_statusline": False})
+        settings = get_tui_settings()
+        assert settings["history_size"] == 12
+        assert settings["show_statusline"] is False
+
+
+def test_effective_profile_prefers_user_session_defaults_over_calibration():
+    config = _default_config()
+    config["profile"] = "m1pro32"
+    config["calibration"] = {
+        "m1pro32": {
+            "runtime": {
+                "default_context": 12000,
+                "keep_alive_seconds": 900,
+            }
+        }
+    }
+    config["session_defaults"] = {
+        "max_context": 4096,
+        "keep_alive_seconds": 300,
+    }
+
+    name, profile = get_effective_profile(config)
+    assert name == "m1pro32"
+    assert profile["default_context"] == 4096
+    assert profile["keep_alive_seconds"] == 300
 
 
 def test_match_profile_m1pro32():

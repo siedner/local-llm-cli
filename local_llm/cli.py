@@ -1,7 +1,10 @@
 """CLI entrypoint for local-llm."""
 
+from __future__ import annotations
+
 import json
 import sys
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -11,14 +14,31 @@ except ImportError:
     print("Error: typer is required. Install with: pip install typer")
     sys.exit(1)
 
-from . import __version__
-from .config import detect_profile, get_profile_name, load_config, save_config
+from . import __version__, ui
+from .config import detect_profile, get_effective_profile, get_profile_name, load_config, save_config
 from .constants import DEFAULT_HOST, DEFAULT_PORT, PROFILES, RECOMMENDED_MODELS
-from . import ui
+from .server import (
+    benchmark_runtime,
+    calibrate_profile,
+    daemon_start,
+    daemon_status,
+    daemon_stop,
+    guide_opencode,
+    inspect_identifier,
+    install_launchd,
+    opencode_snippet,
+    serve,
+    serve_options,
+    serve_status,
+    serve_stop,
+    show_ps,
+    tail_logs,
+    uninstall_launchd,
+)
 
 app = typer.Typer(
     name="local-llm",
-    help="Manage and run local LLMs using MLX-LM on macOS.",
+    help="Mac-first local inference manager for Apple Silicon.",
     no_args_is_help=False,
     invoke_without_command=True,
 )
@@ -30,10 +50,8 @@ def _default(ctx: typer.Context):
     if ctx.invoked_subcommand is None:
         from .tui import CommandPalette
 
-        app_tui = CommandPalette()
-        app_tui.run(mouse=False)
+        CommandPalette().run(mouse=False)
 
-# ── doctor ──────────────────────────────────────────────────────────
 
 @app.command()
 def doctor(
@@ -45,23 +63,19 @@ def doctor(
 
     ui.header("Doctor")
     checks = run_checks()
-    for c in checks:
-        ui.check(c.name, c.ok, detail=c.detail, hint=c.fix_hint or "")
+    for check in checks:
+        ui.check(check.name, check.ok, detail=check.detail, hint=check.fix_hint or "")
     ui.console.print()
 
-    all_ok = all(c.ok for c in checks)
-    if all_ok:
+    if all(check.ok for check in checks):
         ui.success("All checks passed.")
     elif fix:
         ui.info("Attempting to fix issues...")
-        actions = fix_missing(yes=yes)
-        for a in actions:
-            ui.info(f"-> {a}")
+        for action in fix_missing(yes=yes):
+            ui.info(f"-> {action}")
     else:
         ui.warning("Some checks failed. Run `local-llm doctor --fix` to attempt auto-install.")
 
-
-# ── profile ─────────────────────────────────────────────────────────
 
 profile_app = typer.Typer(help="Manage hardware profiles.", no_args_is_help=True)
 app.add_typer(profile_app, name="profile")
@@ -73,20 +87,24 @@ def profile_list():
     config = load_config()
     current = get_profile_name(config)
     ui.header("Profiles")
-    for name, p in PROFILES.items():
+    for name, profile in PROFILES.items():
         marker = "  <-- active" if name == current else ""
-        ui.kv(name, f"{p['chip_pattern']} {p['memory_gb']}GB, max_tokens={p['max_tokens']}{marker}")
+        ui.kv(
+            name,
+            f"{profile['chip_pattern']} {profile['memory_gb']}GB, "
+            f"context={profile['default_context']}/{profile['hard_context']}, "
+            f"max_output={profile['max_tokens']}{marker}",
+        )
 
 
 @profile_app.command("current")
 def profile_current():
     """Show the current profile."""
     config = load_config()
-    name = get_profile_name(config)
-    if name:
-        ui.kv("Current profile", name)
-    else:
-        ui.warning("No profile set. Run `local-llm profile auto` or `local-llm profile set <name>`.")
+    name, profile = get_effective_profile(config)
+    ui.kv("Current profile", name)
+    ui.kv("Context", f"{profile['default_context']} / hard {profile['hard_context']}")
+    ui.kv("Keep alive", f"{profile['keep_alive_seconds']}s")
 
 
 @profile_app.command("set")
@@ -114,7 +132,18 @@ def profile_auto():
         ui.warning("Could not auto-detect profile. Set manually with `local-llm profile set <name>`.")
 
 
-# ── models ──────────────────────────────────────────────────────────
+@profile_app.command("calibrate")
+def profile_calibrate(
+    model: Optional[str] = Argument(None, help="Model to benchmark"),
+    profile: Optional[str] = Option(None, "--profile", help="Profile to calibrate"),
+    runs: int = Option(5, "--runs", help="Benchmark runs"),
+):
+    """Run a conservative calibration benchmark and persist the results."""
+    config = load_config()
+    profile_name, effective = get_effective_profile(config, profile)
+    benchmark_model = model or effective["recommended_models"][0]
+    calibrate_profile(benchmark_model, profile=profile_name, runs=runs)
+
 
 models_app = typer.Typer(help="Manage local models.", no_args_is_help=True)
 app.add_typer(models_app, name="models")
@@ -122,36 +151,35 @@ app.add_typer(models_app, name="models")
 
 @models_app.command("list")
 def models_list(
-    disk: bool = Option(True, "--no-disk", help="Skip showing disk usage"),
+    disk: bool = Option(True, "--disk/--no-disk", help="Show disk usage"),
     as_json: bool = Option(False, "--json", help="Output as JSON"),
 ):
     """List installed models from HF cache."""
     from .models import list_models
 
     models = list_models(disk=disk)
-    if not models:
-        ui.info("No models found in HF cache.")
-        ui.info("Install one with: local-llm models install <hf_repo>")
+    if as_json:
+        ui.console.print_json(json.dumps(models, default=str))
         return
 
-    if as_json:
-        output = []
-        for m in models:
-            entry = {"repo": m["repo"], "path": str(m["path"])}
-            if disk:
-                entry["disk_usage"] = m.get("disk_usage", "unknown")
-            output.append(entry)
-        ui.console.print_json(json.dumps(output))
+    if not models:
+        ui.info("No models found in HF cache.")
         return
 
     table = ui.styled_table(title="Installed Models")
-    table.add_column("Model", style="white")
+    table.add_column("Model")
+    table.add_column("Format", style="cyan")
     if disk:
         table.add_column("Size", style="dim")
-    for m in models:
-        row = [m["repo"]]
+    table.add_column("Use", style="dim")
+    for model in models:
+        row = [
+            model["repo"],
+            model.get("quantization") or "unknown",
+        ]
         if disk:
-            row.append(m.get("disk_usage", "unknown"))
+            row.append(model.get("disk_usage", "unknown"))
+        row.append(model.get("summary", "Installed model"))
         table.add_row(*row)
     ui.console.print(table)
 
@@ -161,8 +189,9 @@ def models_install(
     repo: str = Argument(help="HF repo (org/name)"),
     yes: bool = Option(False, "--yes", "-y", help="Skip confirmation"),
 ):
-    """Download a model (warm-download via mlx_lm.generate)."""
+    """Download a model."""
     from .models import install_model
+
     install_model(repo, yes=yes)
 
 
@@ -171,95 +200,233 @@ def models_remove(
     repo: str = Argument(help="HF repo (org/name)"),
     yes: bool = Option(False, "--yes", "-y", help="Skip confirmation"),
 ):
-    """Remove a model from HF cache."""
+    """Remove a model from cache."""
     from .models import remove_model
+
     remove_model(repo, yes=yes)
+
+
+@models_app.command("verify")
+def models_verify(repo: str = Argument(help="HF repo (org/name)")):
+    """Verify model cache integrity."""
+    from .models import verify_model
+
+    if not verify_model(repo):
+        raise typer.Exit(1)
+
+
+@models_app.command("repair")
+def models_repair(
+    repo: str = Argument(help="HF repo (org/name)"),
+    yes: bool = Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """Repair a broken model by re-downloading it."""
+    from .models import repair_model
+
+    if not repair_model(repo, yes=yes):
+        raise typer.Exit(1)
+
+
+@models_app.command("prune")
+def models_prune(
+    yes: bool = Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """Prune invalid cache entries."""
+    from .models import prune_models
+
+    prune_models(yes=yes)
+
+
+@models_app.command("warm")
+def models_warm(
+    repo: str = Argument(help="HF repo (org/name)"),
+    host: str = Option(DEFAULT_HOST, "--host"),
+    port: int = Option(DEFAULT_PORT, "--port"),
+):
+    """Warm a model in the daemon."""
+    from .models import warm_model
+
+    warm_model(repo, host=host, port=port)
 
 
 @models_app.command("recommended")
 def models_recommended():
     """Show recommended models."""
     ui.header("Recommended Models")
-    ui.console.print()
-    for m in RECOMMENDED_MODELS:
-        ui.kv(m["repo"], m["description"])
-    ui.console.print()
-    config = load_config()
-    favs = config.get("favorite_models", [])
-    if favs:
-        ui.header("Your Favorites")
-        for f in favs:
-            ui.info(f)
+    for model in RECOMMENDED_MODELS:
+        ui.kv(model["repo"], model["description"])
 
 
 @models_app.command("scan")
-def models_scan():
-    """Scan the system for all LLM weights and show a housekeeping report."""
+def models_scan(
+    root: Path = Option(Path.home(), "--root", help="Directory root to scan for model weights"),
+    save: Path = Option(Path.home() / "llm_scan_report.txt", "--save", help="Path to save the scan report"),
+    min_size_mb: int = Option(200, "--min-size-mb", help="Minimum file size in MB to include"),
+):
+    """Scan the system for large LLM weights."""
     from .models import scan_models
-    scan_models()
 
+    scan_models(root=root, save_report=save, min_size_mb=min_size_mb)
 
-# ── chat ────────────────────────────────────────────────────────────
 
 @app.command()
 def chat(
     model: str = Argument(help="HF repo (org/name) of the model"),
-    temp: float = Option(0.7, "--temp", help="Temperature"),
-    top_p: float = Option(0.9, "--top-p", help="Top-p sampling"),
-    top_k: int = Option(50, "--top-k", help="Top-k sampling"),
+    temp: Optional[float] = Option(None, "--temp", help="Temperature"),
+    top_p: Optional[float] = Option(None, "--top-p", help="Top-p sampling"),
+    top_k: Optional[int] = Option(None, "--top-k", help="Top-k sampling"),
+    max_tokens: Optional[int] = Option(None, "--max-tokens", help="Max tokens per response"),
+    profile: Optional[str] = Option(None, "--profile", help="Hardware profile override"),
+    session: Optional[str] = Option(None, "--session", help="Stable session id for warm-path reuse"),
+    keep_alive: Optional[int] = Option(None, "--keep-alive", help="Idle keep-alive in seconds"),
+    safe: bool = Option(True, "--safe/--unsafe", help="Use conservative profile limits"),
+    max_context: Optional[int] = Option(None, "--max-context", help="Context budget for the request"),
 ):
     """Start an interactive chat session."""
     from .chat import chat as do_chat
-    do_chat(model, temp=temp, top_p=top_p, top_k=top_k)
+
+    do_chat(
+        model,
+        temp=temp,
+        top_p=top_p,
+        top_k=top_k,
+        max_tokens=max_tokens,
+        profile=profile,
+        session=session,
+        keep_alive_seconds=keep_alive,
+        safe=safe,
+        max_context=max_context,
+    )
 
 
-# ── serve ───────────────────────────────────────────────────────────
-
-serve_app = typer.Typer(help="Manage the MLX-LM server.", no_args_is_help=True)
+serve_app = typer.Typer(help="Manage the daemon-backed runtime.", no_args_is_help=True)
 app.add_typer(serve_app, name="serve")
 
 
 @serve_app.command("start")
 def serve_start(
     model: str = Argument(help="HF repo (org/name) of the model"),
-    host: str = Option(DEFAULT_HOST, "--host", help="Bind address"),
-    port: int = Option(DEFAULT_PORT, "--port", help="Port"),
-    max_tokens: Optional[int] = Option(None, "--max-tokens", help="Max tokens per response"),
-    detach: bool = Option(False, "--detach", help="Run in background"),
-    log: Optional[str] = Option(None, "--log", help="Log file path (detach mode)"),
-    safe: bool = Option(False, "--safe", help="Force safe concurrency/token limits"),
+    host: str = Option(DEFAULT_HOST, "--host"),
+    port: int = Option(DEFAULT_PORT, "--port"),
+    max_tokens: Optional[int] = Option(None, "--max-tokens"),
+    profile: Optional[str] = Option(None, "--profile", help="Hardware profile override"),
+    keep_alive: Optional[int] = Option(None, "--keep-alive", help="Idle keep-alive in seconds"),
+    log: Optional[str] = Option(None, "--log", help="Daemon log file"),
+    safe: bool = Option(True, "--safe/--unsafe", help="Use conservative profile limits"),
 ):
-    """Start the MLX-LM OpenAI-compatible server."""
-    from .server import serve
-    serve(model, host=host, port=port, max_tokens=max_tokens, detach=detach, log=log, safe=safe)
+    """Start the daemon and warm a model."""
+    serve(
+        model,
+        host=host,
+        port=port,
+        max_tokens=max_tokens,
+        profile=profile,
+        keep_alive_seconds=keep_alive,
+        log=log,
+        safe=safe,
+    )
 
 
 @serve_app.command("stop")
-def serve_stop_cmd(
-    port: int = Option(DEFAULT_PORT, "--port", help="Port of the server to stop"),
-):
-    """Stop a detached server."""
-    from .server import serve_stop
+def serve_stop_cmd(port: int = Option(DEFAULT_PORT, "--port")):
+    """Stop the daemon."""
     serve_stop(port=port)
 
 
 @serve_app.command("status")
-def serve_status_cmd(
-    port: int = Option(DEFAULT_PORT, "--port", help="Port to check"),
-):
-    """Show server status."""
-    from .server import serve_status
+def serve_status_cmd(port: int = Option(DEFAULT_PORT, "--port")):
+    """Show runtime status."""
     serve_status(port=port)
 
 
 @serve_app.command("options")
 def serve_options_cmd():
-    """Show MLX-LM server options and safe defaults."""
-    from .server import serve_options
+    """Show daemon runtime defaults."""
     serve_options()
 
 
-# ── opencode ────────────────────────────────────────────────────────
+daemon_app = typer.Typer(help="Manage the local daemon.", no_args_is_help=True)
+app.add_typer(daemon_app, name="daemon")
+
+
+@daemon_app.command("start")
+def daemon_start_cmd(
+    host: str = Option(DEFAULT_HOST, "--host"),
+    port: int = Option(DEFAULT_PORT, "--port"),
+    detach: bool = Option(True, "--detach/--foreground"),
+    log: Optional[str] = Option(None, "--log"),
+):
+    """Start the daemon."""
+    daemon_start(host=host, port=port, detach=detach, log=log)
+
+
+@daemon_app.command("stop")
+def daemon_stop_cmd(port: int = Option(DEFAULT_PORT, "--port")):
+    """Stop the daemon."""
+    daemon_stop(port=port)
+
+
+@daemon_app.command("status")
+def daemon_status_cmd(
+    host: str = Option(DEFAULT_HOST, "--host"),
+    port: int = Option(DEFAULT_PORT, "--port"),
+):
+    """Show daemon status."""
+    daemon_status(host=host, port=port)
+
+
+@daemon_app.command("install-launchd")
+def daemon_install_launchd_cmd(
+    host: str = Option(DEFAULT_HOST, "--host"),
+    port: int = Option(DEFAULT_PORT, "--port"),
+):
+    """Install the daemon as a launchd agent."""
+    install_launchd(host=host, port=port)
+
+
+@daemon_app.command("uninstall-launchd")
+def daemon_uninstall_launchd_cmd():
+    """Remove the launchd agent."""
+    uninstall_launchd()
+
+
+@app.command("ps")
+def ps_cmd(
+    host: str = Option(DEFAULT_HOST, "--host"),
+    port: int = Option(DEFAULT_PORT, "--port"),
+):
+    """Show the current daemon runtime state."""
+    show_ps(host=host, port=port)
+
+
+@app.command()
+def inspect(
+    identifier: str = Argument(help="Session id or model repo"),
+    host: str = Option(DEFAULT_HOST, "--host"),
+    port: int = Option(DEFAULT_PORT, "--port"),
+):
+    """Inspect a session or the loaded model."""
+    inspect_identifier(identifier, host=host, port=port)
+
+
+@app.command()
+def logs(
+    follow: bool = Option(False, "--follow", "-f", help="Follow daemon logs"),
+):
+    """Print daemon logs."""
+    tail_logs(follow=follow)
+
+
+@app.command()
+def benchmark(
+    model: str = Argument(help="HF repo (org/name)"),
+    runs: int = Option(5, "--runs"),
+    prompt: Optional[str] = Option(None, "--prompt"),
+    profile: Optional[str] = Option(None, "--profile"),
+):
+    """Run a warm-path benchmark through the daemon."""
+    benchmark_runtime(model, runs=runs, prompt=prompt, profile=profile)
+
 
 opencode_app = typer.Typer(help="OpenCode integration helpers.", no_args_is_help=True)
 app.add_typer(opencode_app, name="opencode")
@@ -268,15 +435,12 @@ app.add_typer(opencode_app, name="opencode")
 @opencode_app.command("snippet")
 def opencode_snippet_cmd(
     model: str = Argument(help="HF repo (org/name)"),
-    port: int = Option(DEFAULT_PORT, "--port", help="Server port"),
-    provider_name: str = Option("MLX Local", "--provider-name", help="Provider name"),
+    port: int = Option(DEFAULT_PORT, "--port"),
+    provider_name: str = Option("MLX Local", "--provider-name"),
 ):
     """Print an OpenCode provider JSON snippet."""
-    from .server import opencode_snippet
     opencode_snippet(model, port=port, provider_name=provider_name)
 
-
-# ── guide ───────────────────────────────────────────────────────────
 
 guide_app = typer.Typer(help="Guides and best practices.", no_args_is_help=True)
 app.add_typer(guide_app, name="guide")
@@ -284,12 +448,9 @@ app.add_typer(guide_app, name="guide")
 
 @guide_app.command("opencode")
 def guide_opencode_cmd():
-    """Print best practices for using MLX-LM with OpenCode."""
-    from .server import guide_opencode
+    """Print best practices for using local-llm with OpenCode."""
     guide_opencode()
 
-
-# ── ssh ─────────────────────────────────────────────────────────────
 
 ssh_app = typer.Typer(help="SSH tunnel management (opt-in).", no_args_is_help=True)
 app.add_typer(ssh_app, name="ssh")
@@ -298,57 +459,53 @@ app.add_typer(ssh_app, name="ssh")
 @ssh_app.command("tunnel")
 def ssh_tunnel_cmd(
     to: str = Option(..., "--to", help="SSH destination (user@host)"),
-    remote_port: int = Option(DEFAULT_PORT, "--remote-port", help="Remote server port"),
-    local_port: int = Option(DEFAULT_PORT, "--local-port", help="Local port to forward to"),
-    key: str = Option("~/.ssh/id_ed25519", "--key", help="SSH key path"),
-    bind: str = Option("127.0.0.1", "--bind", help="Local bind address"),
-    detach: bool = Option(False, "--detach", help="Run in background"),
+    remote_port: int = Option(DEFAULT_PORT, "--remote-port"),
+    local_port: int = Option(DEFAULT_PORT, "--local-port"),
+    key: str = Option("~/.ssh/id_ed25519", "--key"),
+    bind: str = Option("127.0.0.1", "--bind"),
+    detach: bool = Option(False, "--detach"),
 ):
     """Create an SSH local forward tunnel."""
     from .ssh import tunnel
+
     tunnel(to=to, remote_port=remote_port, local_port=local_port, key=key, bind=bind, detach=detach)
 
 
 @ssh_app.command("status")
-def ssh_status_cmd(
-    local_port: int = Option(DEFAULT_PORT, "--local-port", help="Local port to check"),
-):
+def ssh_status_cmd(local_port: int = Option(DEFAULT_PORT, "--local-port")):
     """Check status of an SSH tunnel."""
     from .ssh import ssh_status
+
     ssh_status(local_port=local_port)
 
 
 @ssh_app.command("stop")
-def ssh_stop_cmd(
-    local_port: int = Option(DEFAULT_PORT, "--local-port", help="Local port of tunnel to stop"),
-):
+def ssh_stop_cmd(local_port: int = Option(DEFAULT_PORT, "--local-port")):
     """Stop an SSH tunnel."""
     from .ssh import ssh_stop
+
     ssh_stop(local_port=local_port)
 
 
 @ssh_app.command("snippet")
 def ssh_snippet_cmd(
     to: str = Option(..., "--to", help="SSH destination (user@host)"),
-    remote_port: int = Option(DEFAULT_PORT, "--remote-port", help="Remote server port"),
-    local_port: int = Option(DEFAULT_PORT, "--local-port", help="Local port"),
-    key: str = Option("~/.ssh/id_ed25519", "--key", help="SSH key path"),
-    bind: str = Option("127.0.0.1", "--bind", help="Local bind address"),
+    remote_port: int = Option(DEFAULT_PORT, "--remote-port"),
+    local_port: int = Option(DEFAULT_PORT, "--local-port"),
+    key: str = Option("~/.ssh/id_ed25519", "--key"),
+    bind: str = Option("127.0.0.1", "--bind"),
 ):
-    """Print SSH command and OpenCode base URL."""
+    """Print SSH command and base URL."""
     from .ssh import ssh_snippet
+
     ssh_snippet(to=to, remote_port=remote_port, local_port=local_port, key=key, bind=bind)
 
-
-# ── version ─────────────────────────────────────────────────────────
 
 @app.command()
 def version():
     """Show version."""
     ui.banner(__version__)
 
-
-# ── main ────────────────────────────────────────────────────────────
 
 def main():
     app()

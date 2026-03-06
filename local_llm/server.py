@@ -1,4 +1,4 @@
-"""Server management: serve, stop, status."""
+"""Daemon management and CLI compatibility wrappers."""
 
 from __future__ import annotations
 
@@ -6,27 +6,156 @@ import json
 import os
 import signal
 import subprocess
-import sys
+import time
 from pathlib import Path
 from typing import Optional
 
 from . import ui
-from .config import get_profile, load_config
-from .constants import DEFAULT_HOST, DEFAULT_PORT, LOGS_DIR, PIDS_DIR, PROFILES
+from .config import detect_profile, get_effective_profile, load_config, save_calibration
+from .constants import (
+    DAEMON_LOG_FILE,
+    DAEMON_PID_FILE,
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    LAUNCHD_LABEL,
+    LAUNCHD_PLIST,
+    PACKAGE_ROOT,
+)
+from .daemon_client import DaemonClient, DaemonError
 from .doctor import get_mlx_python
+from .launchd import write_launchd_plist
+from .runtime import get_listening_process_info, get_process_info
 
 
-def _ensure_dirs():
-    PIDS_DIR.mkdir(parents=True, exist_ok=True)
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+def _daemon_env() -> dict:
+    env = os.environ.copy()
+    pythonpath = env.get("PYTHONPATH", "")
+    roots = [str(PACKAGE_ROOT)]
+    if pythonpath:
+        roots.append(pythonpath)
+    env["PYTHONPATH"] = ":".join(roots)
+    return env
 
 
-def _pid_file(port: int) -> Path:
-    return PIDS_DIR / f"server-{port}.pid"
+def _daemon_cmd(host: str, port: int) -> list[str]:
+    python = get_mlx_python()
+    return [python, "-m", "local_llm.daemon", "--host", host, "--port", str(port)]
 
 
-def _log_file(port: int) -> Path:
-    return LOGS_DIR / f"server-{port}.log"
+def _wait_for_daemon(client: DaemonClient, timeout: int = 30) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            client.health()
+            return True
+        except Exception:
+            time.sleep(0.5)
+    return False
+
+
+def daemon_start(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    detach: bool = True,
+    log: Optional[str] = None,
+) -> None:
+    """Start the local-llm daemon."""
+    client = DaemonClient(host, port)
+    try:
+        health = client.health()
+        ui.success(f"Daemon already running on {host}:{port}")
+        if health.get("loaded_model"):
+            ui.kv("Loaded model", health["loaded_model"])
+        return
+    except Exception:
+        pass
+
+    cmd = _daemon_cmd(host, port)
+    env = _daemon_env()
+    log_path = Path(log) if log else DAEMON_LOG_FILE
+    if detach:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as log_fh:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=env,
+                cwd=str(PACKAGE_ROOT),
+            )
+        DAEMON_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DAEMON_PID_FILE.write_text(str(proc.pid), encoding="utf-8")
+        ui.info("Starting daemon in background...")
+        ui.kv("PID", str(proc.pid))
+        ui.kv("Log", str(log_path))
+        if _wait_for_daemon(client):
+            ui.success(f"Daemon ready at http://{host}:{port}/v1")
+        else:
+            exited = proc.poll()
+            DAEMON_PID_FILE.unlink(missing_ok=True)
+            if exited is not None:
+                ui.error(f"Daemon exited during startup with code {exited}.")
+            else:
+                ui.warning(f"Daemon did not report healthy within timeout. Check {log_path}")
+    else:
+        ui.info("Starting daemon in foreground (Ctrl+C to stop)...")
+        subprocess.run(cmd, env=env, cwd=str(PACKAGE_ROOT))
+
+
+def daemon_stop(port: int = DEFAULT_PORT) -> None:
+    """Stop the daemon process."""
+    pid = None
+    info = None
+    if DAEMON_PID_FILE.exists():
+        pid = int(DAEMON_PID_FILE.read_text().strip())
+        info = get_process_info(pid)
+    else:
+        info = get_listening_process_info(port)
+        pid = info.pid if info else None
+        if pid is None:
+            ui.warning("No daemon PID file found.")
+            return
+
+    if not info or info.module_name != "local_llm.daemon":
+        ui.error(f"PID {pid} is not a local_llm.daemon process; refusing to kill it.")
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if get_process_info(pid) is None:
+                DAEMON_PID_FILE.unlink(missing_ok=True)
+                ui.success(f"Stopped daemon PID {pid}.")
+                return
+            time.sleep(0.2)
+        ui.warning(f"Daemon PID {pid} did not exit after SIGTERM; sending SIGKILL.")
+        os.kill(pid, signal.SIGKILL)
+        ui.success(f"Killed daemon PID {pid}.")
+    except OSError as exc:
+        ui.error(str(exc))
+    finally:
+        DAEMON_PID_FILE.unlink(missing_ok=True)
+
+
+def daemon_status(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+    """Show daemon status."""
+    client = DaemonClient(host, port)
+    try:
+        snapshot = client.health()
+    except Exception:
+        ui.info(f"No daemon detected on {host}:{port}.")
+        return
+
+    ui.header("Daemon Status")
+    ui.kv("State", snapshot["status"])
+    ui.kv("Profile", snapshot["profile"])
+    ui.kv("Base URL", f"http://{host}:{port}/v1")
+    ui.kv("Loaded model", snapshot.get("loaded_model") or "none")
+    ui.kv("Memory pressure", snapshot["memory_pressure"]["state"])
+    ui.kv("Keep alive", str(snapshot["keep_alive_seconds"]))
+    if snapshot.get("active_request_id"):
+        ui.kv("Active request", snapshot["active_request_id"])
 
 
 def serve(
@@ -34,236 +163,170 @@ def serve(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     max_tokens: Optional[int] = None,
+    profile: Optional[str] = None,
+    keep_alive_seconds: Optional[int] = None,
     detach: bool = False,
     log: Optional[str] = None,
     safe: bool = False,
 ) -> None:
-    """Start the MLX-LM OpenAI-compatible server."""
-    _ensure_dirs()
+    """Start or warm the daemon-backed local runtime."""
+    if not detach:
+        ui.info("`serve start` warms models through the background daemon; starting it detached.")
+    daemon_start(host=host, port=port, detach=True, log=log)
+    client = DaemonClient(host, port)
     config = load_config()
-    profile = get_profile(config)
+    profile_name, profile = get_effective_profile(config, profile)
+    effective_max_tokens = min(max_tokens or profile["max_tokens"], profile["max_tokens"])
+    try:
+        result = client.warm(
+            model,
+            keep_alive_seconds=keep_alive_seconds or profile["keep_alive_seconds"],
+            profile=profile_name,
+            safe_mode=safe,
+        )
+    except DaemonError as exc:
+        ui.error(str(exc))
+        return
 
-    # Determine server args
-    decode_concurrency = 1
-    prompt_concurrency = 1
-
-    if max_tokens is None:
-        if profile:
-            max_tokens = profile["max_tokens"]
-        else:
-            max_tokens = 1024  # conservative default
-
-    if safe:
-        decode_concurrency = 1
-        prompt_concurrency = 1
-        if profile and max_tokens > profile["max_tokens"]:
-            max_tokens = profile["max_tokens"]
-        ui.warning("SAFE MODE  Concurrency=1, reduced max-tokens")
-
-    # Print summary panel
-    config_table = ui.styled_table(box=None, padding=(0, 1, 0, 0), show_header=False)
-    config_table.add_column("Key", style="white", no_wrap=True)
-    config_table.add_column("Value", style="dim")
-
-    profile_name = config.get("profile", "none")
-    config_table.add_row("Profile", profile_name)
-    config_table.add_row("Model", model)
-    config_table.add_row("Host", host)
-    config_table.add_row("Port", str(port))
-    config_table.add_row("Max tokens", str(max_tokens))
-    config_table.add_row("Concurrency", f"decode={decode_concurrency} prompt={prompt_concurrency}")
-
-    ui.rich_panel(config_table, title="Server Config")
-
-    # Risk hints
-    if profile:
-        for hint in profile.get("risk_hints", []):
-            ui.warning(hint)
-        ui.console.print()
-
-    base_url = f"http://{host}:{port}/v1"
-    ui.kv("Base URL", base_url)
+    ui.header("Runtime")
+    ui.kv("Profile", profile_name)
+    ui.kv("Model", model)
+    ui.kv("Base URL", f"http://{host}:{port}/v1")
+    ui.kv("Max output", str(effective_max_tokens))
+    ui.kv("Context", f"{profile['default_context']} / hard {profile['hard_context']}")
+    ui.kv("Keep alive", f"{result['keep_alive_seconds']}s")
+    ui.kv("Warm path", "reused" if result["reused"] else "fresh load")
+    if result.get("load_duration_seconds") is not None:
+        ui.kv("Load time", f"{result['load_duration_seconds']:.2f}s")
     ui.console.print()
     _print_opencode_snippet(model, port)
-    ui.console.print()
-
-    python = get_mlx_python()
-    cmd = [
-        python, "-m", "mlx_lm.server",
-        "--model", model,
-        "--host", host,
-        "--port", str(port),
-        "--max-tokens", str(max_tokens),
-        "--decode-concurrency", str(decode_concurrency),
-        "--prompt-concurrency", str(prompt_concurrency),
-    ]
-
-    if detach:
-        log_path = Path(log) if log else _log_file(port)
-        ui.info(f"Starting in background...")
-        ui.kv("Log", str(log_path))
-        log_fh = open(log_path, "w")
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        pid_file = _pid_file(port)
-        pid_file.write_text(str(proc.pid))
-        ui.kv("PID", str(proc.pid))
-        ui.kv("Stop", f"local-llm serve stop --port {port}")
-    else:
-        ui.info("Starting server (Ctrl+C to stop)...")
-        ui.divider()
-        try:
-            proc = subprocess.run(cmd)
-        except KeyboardInterrupt:
-            ui.console.print()
-            ui.info("Server stopped.")
 
 
 def serve_stop(port: int = DEFAULT_PORT) -> None:
-    """Stop a detached server by port."""
-    pid_file = _pid_file(port)
-    if not pid_file.exists():
-        ui.warning(f"No PID file for port {port}. Server may not be running.")
-        _try_lsof_kill(port)
-        return
-
-    pid = int(pid_file.read_text().strip())
-    try:
-        os.kill(pid, signal.SIGTERM)
-        ui.success(f"Sent SIGTERM to PID {pid} (port {port}).")
-    except ProcessLookupError:
-        ui.info(f"Process {pid} not found (already stopped?).")
-    pid_file.unlink(missing_ok=True)
-
-
-def _fingerprint_port_pid(port: int) -> dict | None:
-    """Find the PID listening on port and fingerprint its commandline.
-
-    Returns a dict with keys: pid, cmdline, is_mlx_server, model
-    or None if nothing is listening.
-    """
-    try:
-        lsof = subprocess.run(
-            ["lsof", "-ti", f":{port}", "-sTCP:LISTEN"],
-            capture_output=True, text=True, timeout=5,
-        )
-        raw_pids = [p.strip() for p in lsof.stdout.strip().split("\n") if p.strip()]
-        if not raw_pids:
-            return None
-
-        # Pick the first PID (usually only one listens on the port)
-        pid = int(raw_pids[0])
-
-        ps = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
-            capture_output=True, text=True, timeout=5,
-        )
-        cmdline = ps.stdout.strip()
-
-        is_mlx = "mlx_lm.server" in cmdline or "mlx_lm" in cmdline
-
-        # Try to extract --model argument from command line
-        model = None
-        if "--model" in cmdline:
-            parts = cmdline.split()
-            for i, part in enumerate(parts):
-                if part == "--model" and i + 1 < len(parts):
-                    model = parts[i + 1]
-                    break
-
-        return {"pid": pid, "cmdline": cmdline, "is_mlx_server": is_mlx, "model": model}
-    except Exception:
-        return None
+    """Stop the daemon."""
+    daemon_stop(port=port)
 
 
 def serve_status(port: int = DEFAULT_PORT) -> None:
-    """Show status of a server on a given port."""
-    pid_file = _pid_file(port)
-    log_file = _log_file(port)
-
-    # Case 1: We have a PID file from a managed server
-    if pid_file.exists():
-        pid = int(pid_file.read_text().strip())
-        try:
-            os.kill(pid, 0)  # 0 = just check if alive
-            info = _fingerprint_port_pid(port)
-            ui.success(f"Server running on port {port}")
-            ui.kv("PID", str(pid))
-            if info and info["model"]:
-                ui.kv("Model", info["model"])
-            if log_file.exists():
-                ui.kv("Log", str(log_file))
-            ui.kv("Stop", f"local-llm serve stop --port {port}")
-        except ProcessLookupError:
-            ui.warning(f"Stale PID file: process {pid} is no longer running.")
-            pid_file.unlink(missing_ok=True)
-            # Fall through to port scan below
-            _check_port_unmanaged(port)
-        return
-
-    # Case 2: No PID file – check if anything is on the port
-    _check_port_unmanaged(port)
+    """Show runtime status."""
+    daemon_status(port=port)
 
 
-def _check_port_unmanaged(port: int) -> None:
-    """Check whether an unmanaged process is listening on port and fingerprint it."""
-    info = _fingerprint_port_pid(port)
-    if not info:
-        ui.info(f"No server detected on port {port}.")
-        return
-
-    pid = info["pid"]
-    if info["is_mlx_server"]:
-        model_str = f" ({info['model']}" + ")" if info["model"] else ""
-        ui.warning(f"mlx_lm.server detected on port {port} (PID {pid}){model_str}")
-        ui.info("This looks like an orphaned local-llm server from a previous session.")
-        ui.kv("Cmdline", info["cmdline"][:80] + ("..." if len(info["cmdline"]) > 80 else ""))
-        if ui.confirm("Kill it and reclaim the port?"):
-            try:
-                os.kill(pid, signal.SIGTERM)
-                ui.success(f"Sent SIGTERM to PID {pid}.")
-            except Exception as e:
-                ui.error(f"Failed to kill PID {pid}: {e}")
-    else:
-        ui.warning(f"Port {port} is in use by a non-mlx process (PID {pid}).")
-        ui.kv("Cmdline", info["cmdline"][:80] + ("..." if len(info["cmdline"]) > 80 else ""))
-        ui.info("This is not a local-llm server — not touching it.")
-
-
-def _try_lsof_kill(port: int) -> None:
-    """Try to find and kill process on port via lsof."""
+def show_ps(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+    """Show runtime snapshot."""
+    client = DaemonClient(host, port)
     try:
-        result = subprocess.run(
-            ["lsof", "-ti", f":{port}"],
-            capture_output=True, text=True, timeout=5,
+        snapshot = client.ps()
+    except Exception as exc:
+        ui.error(str(exc))
+        return
+    ui.header("Runtime")
+    ui.kv("State", snapshot["status"])
+    ui.kv("Model", snapshot.get("loaded_model") or "none")
+    ui.kv("Profile", snapshot["profile"])
+    ui.kv("Sessions", str(snapshot["session_count"]))
+    ui.kv("Memory pressure", snapshot["memory_pressure"]["state"])
+
+
+def inspect_identifier(identifier: str, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+    """Inspect a session or model."""
+    client = DaemonClient(host, port)
+    try:
+        result = client.inspect(identifier)
+    except Exception as exc:
+        ui.error(str(exc))
+        return
+    ui.code_block(json.dumps(result, indent=2), lang="json")
+
+
+def tail_logs(follow: bool = False) -> None:
+    """Print daemon logs."""
+    if not DAEMON_LOG_FILE.exists():
+        ui.warning("No daemon log file found.")
+        return
+    if follow:
+        subprocess.run(["tail", "-f", str(DAEMON_LOG_FILE)])
+    else:
+        subprocess.run(["tail", "-n", "100", str(DAEMON_LOG_FILE)])
+
+
+def benchmark_runtime(
+    model: str,
+    *,
+    runs: int = 5,
+    prompt: Optional[str] = None,
+    profile: Optional[str] = None,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> dict | None:
+    """Run a benchmark through the daemon."""
+    daemon_start(host=host, port=port, detach=True)
+    client = DaemonClient(host, port)
+    try:
+        result = client.benchmark(
+            {
+                "model": model,
+                "runs": runs,
+                "prompt": prompt,
+                "profile": profile,
+            }
         )
-        if result.stdout.strip():
-            pids = result.stdout.strip().split("\n")
-            ui.info(f"Found process(es) on port {port}: {', '.join(pids)}")
-            if ui.confirm("Kill them?"):
-                for pid in pids:
-                    os.kill(int(pid), signal.SIGTERM)
-                ui.success("Sent SIGTERM.")
-    except Exception:
-        pass
+    except Exception as exc:
+        ui.error(str(exc))
+        return None
+
+    ui.header("Benchmark")
+    ui.kv("Model", result["model"])
+    ui.kv("Profile", result["profile"])
+    ui.kv("Runs", str(result["runs"]))
+    ui.kv("Avg total", f"{result['avg_total_seconds']:.2f}s")
+    ui.kv("Avg TTFT", f"{result['avg_ttft_seconds']:.2f}s")
+    ui.kv("Avg tok/s", f"{result['avg_generation_tps']:.2f}")
+    return result
 
 
-def _print_opencode_snippet(model: str, port: int) -> None:
-    """Print an OpenCode provider snippet."""
-    snippet = {
-        "provider": {
-            "name": "MLX Local",
-            "type": "openai",
-            "url": f"http://127.0.0.1:{port}/v1",
-            "model": model,
-        }
+def calibrate_profile(
+    model: str,
+    *,
+    profile: Optional[str] = None,
+    runs: int = 5,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> None:
+    """Benchmark and persist conservative calibration metadata."""
+    benchmark = benchmark_runtime(model, runs=runs, profile=profile, host=host, port=port)
+    if benchmark is None:
+        return
+    config = load_config()
+    profile_name, effective = get_effective_profile(config, profile or detect_profile())
+    calibration = {
+        "updated_at": time.time(),
+        "runtime": {
+            "default_context": effective["default_context"],
+            "hard_context": effective["hard_context"],
+            "max_tokens": effective["max_tokens"],
+            "keep_alive_seconds": effective["keep_alive_seconds"],
+        },
+        "benchmark": benchmark,
     }
-    ui.info("OpenCode provider snippet:")
-    ui.code_block(json.dumps(snippet, indent=2), lang="json")
+    save_calibration(profile_name, calibration)
+    ui.success(f"Saved calibration for profile {profile_name}.")
+
+
+def install_launchd(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+    """Install the daemon as a launchd agent."""
+    plist = write_launchd_plist(host=host, port=port)
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], check=False)
+    subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)], check=False)
+    ui.success(f"Installed launchd agent {LAUNCHD_LABEL}.")
+    ui.kv("Plist", str(plist))
+
+
+def uninstall_launchd() -> None:
+    """Remove the launchd agent."""
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], check=False)
+    LAUNCHD_PLIST.unlink(missing_ok=True)
+    ui.success(f"Removed launchd agent {LAUNCHD_LABEL}.")
 
 
 def opencode_snippet(model: str, port: int = DEFAULT_PORT, provider_name: str = "MLX Local") -> None:
@@ -279,60 +342,29 @@ def opencode_snippet(model: str, port: int = DEFAULT_PORT, provider_name: str = 
     ui.code_block(json.dumps(snippet, indent=2), lang="json")
 
 
+def _print_opencode_snippet(model: str, port: int) -> None:
+    ui.info("OpenCode provider snippet:")
+    opencode_snippet(model, port=port)
+
+
 def serve_options() -> None:
-    """Print known server flags and safe defaults."""
-    ui.header("MLX-LM Server Options")
-    ui.console.print()
-
-    flags = (
-        "  --model <hf_repo>        Model to serve\n"
-        "  --host <addr>            Bind address (default: 127.0.0.1)\n"
-        "  --port <port>            Port (default: 8080)\n"
-        "  --max-tokens <n>         Max tokens per response\n"
-        "  --decode-concurrency <n> Concurrent decode requests\n"
-        "  --prompt-concurrency <n> Concurrent prompt processing"
+    """Print runtime defaults and controls."""
+    ui.header("Daemon Runtime Defaults")
+    ui.panel(
+        "  one warm model per machine\n"
+        "  one active request at a time\n"
+        "  profile-aware context caps\n"
+        "  keep-alive based idle eviction\n"
+        "  macOS memory-pressure admission control",
+        title="Operating model",
     )
-    ui.panel(flags, title="Key flags for `python -m mlx_lm.server`")
-    ui.console.print()
-
-    defaults = (
-        "  --decode-concurrency 1\n"
-        "  --prompt-concurrency 1\n"
-        "  --max-tokens 1024  (M4 16GB)\n"
-        "  --max-tokens 2048  (M1 Pro 32GB)"
-    )
-    ui.panel(defaults, title="Safe defaults (recommended for OpenCode)")
-    ui.console.print()
-
-    ui.warning("OpenCode sends large prefills (tool schema + repo context).")
-    ui.warning("This can exceed 10k tokens and cause Metal OOM crashes.")
-    ui.warning("Use `--safe` flag with `local-llm serve` to enforce safe limits.")
 
 
 def guide_opencode() -> None:
     """Print best practices for using MLX-LM with OpenCode."""
-    ui.header("Guide: Using MLX-LM with OpenCode")
-
-    sections = [
-        ("1. Use text-only models (not multimodal)",
-         "Recommended: Qwen3.5-4B with MLX quantization"),
-        ("2. Keep context small",
-         "OpenCode sends tool schemas + repo context in every request.\n"
-         "This can easily exceed 10k tokens on prefill.\n"
-         "Large prefills cause Metal OOM on 16GB machines."),
-        ("3. Start with a small repo to validate",
-         "Test with a tiny project first.\n"
-         "If it works, gradually increase project size."),
-        ("4. Use --safe mode",
-         "local-llm serve <model> --safe"),
-        ("5. Monitor memory usage",
-         "Watch Activity Monitor for 'Memory Pressure'.\n"
-         "If yellow/red, stop the server and use a smaller model."),
-        ("6. Recommended models",
-         "RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4\n"
-         "RepublicOfKorokke/Qwen3.5-4B-mlx-lm-nvfp4"),
-    ]
-
-    for title, body in sections:
-        ui.console.print()
-        ui.panel(body, title=title)
+    ui.header("Guide: Using local-llm with OpenCode")
+    ui.panel(
+        "Keep one small model warm, clamp max output aggressively, and prefer shorter tool/repo context windows.\n"
+        "Use `local-llm profile calibrate` on each Mac before trusting bigger contexts.",
+        title="Best practices",
+    )

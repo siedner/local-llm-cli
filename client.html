@@ -89,6 +89,39 @@
             flex-wrap: wrap;
         }
 
+        .settings-row {
+            display: flex;
+            gap: 0.75rem;
+            align-items: center;
+            flex-wrap: wrap;
+            width: 100%;
+            justify-content: flex-end;
+        }
+
+        .input-box.small {
+            width: 90px;
+        }
+
+        .input-box.medium {
+            width: 130px;
+        }
+
+        .toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 0.45rem 0.7rem;
+        }
+
+        .toggle input {
+            accent-color: var(--accent);
+        }
+
         .input-box {
             background: rgba(15, 23, 42, 0.6);
             border: 1px solid var(--border-color);
@@ -572,17 +605,33 @@
                 New
             </button>
         </div>
-        <div class="settings-group">
-            <input type="text" id="api-url" class="input-box" value="http://127.0.0.1:8080/v1" placeholder="API URL">
-            <select id="model-select" class="input-box">
-                <option value="">Loading models...</option>
-            </select>
-            <button class="btn primary" id="refresh-btn" onclick="fetchModels()">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M21 2v6h-6" />
-                    <path d="M3 12a9 9 0 1 0 2.32-5.94L21 8" />
-                </svg>
-            </button>
+        <div class="settings-group" style="flex-direction: column; align-items: flex-end;">
+            <div class="settings-row">
+                <input type="text" id="api-url" class="input-box" value="http://127.0.0.1:8080/v1" placeholder="API URL">
+                <select id="model-select" class="input-box">
+                    <option value="">Loading models...</option>
+                </select>
+                <button class="btn" id="warm-btn" onclick="warmSelectedModel()">Warm</button>
+                <button class="btn primary" id="refresh-btn" onclick="fetchModels()">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 2v6h-6" />
+                        <path d="M3 12a9 9 0 1 0 2.32-5.94L21 8" />
+                    </svg>
+                </button>
+            </div>
+            <div class="settings-row">
+                <input type="text" id="session-id" class="input-box medium" placeholder="Session ID">
+                <input type="number" id="temperature" class="input-box small" value="0.7" min="0" max="2" step="0.1" title="Temperature" placeholder="Temp">
+                <input type="number" id="top-p" class="input-box small" value="0.9" min="0" max="1" step="0.05" title="Top-p" placeholder="Top-p">
+                <input type="number" id="top-k" class="input-box small" value="50" min="0" step="1" title="Top-k" placeholder="Top-k">
+                <input type="number" id="max-tokens" class="input-box small" value="512" min="1" step="1" title="Max output tokens" placeholder="Max out">
+                <input type="number" id="max-context" class="input-box small" min="1" step="1" title="Max context" placeholder="Context">
+                <input type="number" id="keep-alive" class="input-box small" min="1" step="1" title="Keep alive seconds" placeholder="Keep alive">
+                <label class="toggle" title="Use conservative profile-aware limits">
+                    <input type="checkbox" id="safe-mode" checked>
+                    <span>Safe</span>
+                </label>
+            </div>
         </div>
     </header>
 
@@ -640,6 +689,12 @@
     <script>
         let chatHistory = [];
         let currentController = null;
+        let currentRequestId = null;
+        let currentBaseUrl = null;
+
+        function newSessionId() {
+            return `web-${Math.random().toString(36).slice(2, 10)}`;
+        }
 
         // Configure Marked
         marked.setOptions({
@@ -661,6 +716,7 @@
         function newChat() {
             if (chatHistory.length > 0 && !confirm("Clear current conversation?")) return;
             chatHistory = [];
+            document.getElementById('session-id').value = newSessionId();
             document.getElementById('messages-container').innerHTML = `
                 <div id="empty-state" class="empty-state">
                     <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
@@ -688,22 +744,31 @@
             statusText.textContent = 'Connecting...';
 
             try {
-                const res = await fetch(`${baseUrl}/models`);
-                if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-                const data = await res.json();
+                const [healthRes, modelsRes] = await Promise.all([
+                    fetch(`${baseUrl}/local/health`),
+                    fetch(`${baseUrl}/local/models`)
+                ]);
+                if (!healthRes.ok || !modelsRes.ok) throw new Error(`HTTP error! health=${healthRes.status} models=${modelsRes.status}`);
+                const health = await healthRes.json();
+                const data = await modelsRes.json();
                 select.innerHTML = '';
 
-                if (data.data && data.data.length > 0) {
-                    data.data.forEach(model => {
+                if (data.models && data.models.length > 0) {
+                    data.models.forEach(model => {
                         const opt = document.createElement('option');
-                        opt.value = model.id;
-                        const sizeMatch = model.id.match(/(?:^|-|_)([0-9]+(?:x[0-9]+)?(?:\.[0-9]+)?[bBmMtT])(?:-|_|$)/);
+                        opt.value = model.repo;
+                        const sizeMatch = model.repo.match(/(?:^|-|_)([0-9]+(?:x[0-9]+)?(?:\.[0-9]+)?[bBmMtT])(?:-|_|$)/);
                         const sizeStr = sizeMatch ? ` (${sizeMatch[1].toUpperCase()})` : '';
-                        opt.textContent = model.id + sizeStr;
+                        const diskStr = model.disk_usage ? ` · ${model.disk_usage}` : '';
+                        opt.textContent = model.repo + sizeStr + diskStr;
                         select.appendChild(opt);
                     });
+                    if (health.loaded_model) {
+                        select.value = health.loaded_model;
+                    }
                     statusBadge.className = 'status-badge connected';
-                    statusText.textContent = 'Connected';
+                    const state = health.status || 'unknown';
+                    statusText.textContent = health.loaded_model ? `${state} · ${health.loaded_model}` : state;
                 } else {
                     select.innerHTML = '<option value="">No models found</option>';
                     statusBadge.className = 'status-badge';
@@ -716,6 +781,37 @@
                 statusText.textContent = 'Disconnected';
             } finally {
                 refreshBtn.disabled = false;
+            }
+        }
+
+        async function warmSelectedModel() {
+            const baseUrl = document.getElementById('api-url').value.replace(/\/+$/, "");
+            const model = document.getElementById('model-select').value;
+            if (!model) return;
+
+            const keepAlive = parseIntegerOrNull(document.getElementById('keep-alive').value);
+            const safeMode = document.getElementById('safe-mode').checked;
+            const refreshBtn = document.getElementById('refresh-btn');
+            const warmBtn = document.getElementById('warm-btn');
+            refreshBtn.disabled = true;
+            warmBtn.disabled = true;
+            try {
+                const response = await fetch(`${baseUrl}/local/warm`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model,
+                        keep_alive_seconds: keepAlive,
+                        safe_mode: safeMode
+                    })
+                });
+                if (!response.ok) throw new Error(`Warm failed: ${response.status}`);
+                await fetchModels();
+            } catch (error) {
+                appendMessage('bot', "Error warming model: " + error.message);
+            } finally {
+                refreshBtn.disabled = false;
+                warmBtn.disabled = false;
             }
         }
 
@@ -796,10 +892,31 @@
         function stopGeneration() {
             if (currentController) {
                 currentController.abort();
-                currentController = null;
             }
+            if (currentRequestId && currentBaseUrl) {
+                fetch(`${currentBaseUrl}/local/cancel`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ request_id: currentRequestId })
+                }).catch(() => { });
+            }
+            currentController = null;
+            currentRequestId = null;
+            currentBaseUrl = null;
             toggleButtons(false);
             document.getElementById('typing-indicator').classList.remove('active');
+        }
+
+        function parseIntegerOrNull(value) {
+            if (value === null || value === undefined || value === '') return null;
+            const parsed = Number.parseInt(value, 10);
+            return Number.isFinite(parsed) ? parsed : null;
+        }
+
+        function parseFloatOrNull(value) {
+            if (value === null || value === undefined || value === '') return null;
+            const parsed = Number.parseFloat(value);
+            return Number.isFinite(parsed) ? parsed : null;
         }
 
         function toggleButtons(generating) {
@@ -813,8 +930,17 @@
             const selectedModel = document.getElementById('model-select').value;
             const baseUrl = document.getElementById('api-url').value.replace(/\/+$/, "");
             const systemPrompt = document.getElementById('system-prompt').value.trim();
+            const sessionId = document.getElementById('session-id').value.trim() || newSessionId();
+            const temperature = parseFloatOrNull(document.getElementById('temperature').value);
+            const topP = parseFloatOrNull(document.getElementById('top-p').value);
+            const topK = parseIntegerOrNull(document.getElementById('top-k').value);
+            const maxTokens = parseIntegerOrNull(document.getElementById('max-tokens').value);
+            const maxContext = parseIntegerOrNull(document.getElementById('max-context').value);
+            const keepAlive = parseIntegerOrNull(document.getElementById('keep-alive').value);
+            const safeMode = document.getElementById('safe-mode').checked;
 
             if (!text || !selectedModel) return;
+            document.getElementById('session-id').value = sessionId;
 
             // UI Updates
             input.value = '';
@@ -836,13 +962,29 @@
             scrollToBottom();
 
             currentController = new AbortController();
+            currentBaseUrl = baseUrl;
+            currentRequestId = null;
             const startTimestamp = Date.now();
 
             try {
+                const payload = {
+                    model: selectedModel,
+                    messages: messagesToSend,
+                    stream: true,
+                    session: sessionId,
+                    safe: safeMode
+                };
+                if (temperature !== null) payload.temperature = temperature;
+                if (topP !== null) payload.top_p = topP;
+                if (topK !== null) payload.top_k = topK;
+                if (maxTokens !== null) payload.max_tokens = maxTokens;
+                if (maxContext !== null) payload.max_context = maxContext;
+                if (keepAlive !== null) payload.keep_alive_seconds = keepAlive;
+
                 const response = await fetch(`${baseUrl}/chat/completions`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ model: selectedModel, messages: messagesToSend, stream: true }),
+                    body: JSON.stringify(payload),
                     signal: currentController.signal
                 });
 
@@ -855,35 +997,52 @@
                 let bubbleElement = appendMessage('bot', '');
                 let footerElement = document.getElementById('last-bot-footer');
                 if (footerElement) footerElement.id = ''; // Un-id it so we only target the latest
+                let sseBuffer = "";
 
                 while (true) {
                     const { done, value } = await reader.read();
                     if (done) break;
 
-                    const chunk = decoder.decode(value, { stream: true });
-                    const lines = chunk.split('\n');
+                    sseBuffer += decoder.decode(value, { stream: true });
+                    const events = sseBuffer.split('\n\n');
+                    sseBuffer = events.pop() || "";
 
-                    for (const line of lines) {
-                        if (line.trim() === 'data: [DONE]') continue;
-                        if (line.startsWith('data: ')) {
-                            try {
-                                const data = JSON.parse(line.substring(6));
-                                if (data.choices && data.choices[0].delta && data.choices[0].delta.content) {
-                                    botFullResponse += data.choices[0].delta.content;
-                                    bubbleElement.innerHTML = renderMarkdown(botFullResponse);
+                    for (const eventBlock of events) {
+                        const lines = eventBlock.split('\n');
+                        const dataLines = lines.filter(line => line.startsWith('data: ')).map(line => line.slice(6));
+                        if (dataLines.length === 0) continue;
+                        const raw = dataLines.join('\n').trim();
+                        if (raw === '[DONE]') continue;
+                        try {
+                            const data = JSON.parse(raw);
+                            if (data.id && !currentRequestId) currentRequestId = data.id;
 
-                                    // Update stats
-                                    const elapsed = (Date.now() - startTimestamp) / 1000;
-                                    const tokens = botFullResponse.length / 4; // Crude estimation
-                                    if (footerElement) {
-                                        footerElement.textContent = `${Math.round(tokens)} tokens · ${(tokens / elapsed).toFixed(1)} t/s`;
-                                    }
-                                }
+                            if (data.object === 'local_llm.summary') {
                                 if (data.usage) {
-                                    const usage = data.usage;
-                                    document.getElementById('token-usage-total').textContent = `Total: ${usage.total_tokens} tokens`;
+                                    document.getElementById('token-usage-total').textContent = `Total: ${data.usage.total_tokens} tokens`;
                                 }
-                            } catch (e) { }
+                                const metrics = data.local_llm?.metrics || {};
+                                if (footerElement) {
+                                    const tps = metrics.generation_tps ? `${metrics.generation_tps.toFixed(1)} t/s` : '';
+                                    const ttft = metrics.ttft_seconds ? `TTFT ${metrics.ttft_seconds.toFixed(2)}s` : '';
+                                    const cache = metrics.cache_hit ? `cache ${metrics.cached_prefix_tokens || 0}` : '';
+                                    footerElement.textContent = [tps, ttft, cache].filter(Boolean).join(' · ');
+                                }
+                                continue;
+                            }
+
+                            if (data.choices && data.choices[0].delta && data.choices[0].delta.content) {
+                                botFullResponse += data.choices[0].delta.content;
+                                bubbleElement.innerHTML = renderMarkdown(botFullResponse);
+
+                                const elapsed = Math.max((Date.now() - startTimestamp) / 1000, 0.1);
+                                const tokens = botFullResponse.length / 4;
+                                if (footerElement) {
+                                    footerElement.textContent = `${Math.round(tokens)} tokens · ${(tokens / elapsed).toFixed(1)} t/s`;
+                                }
+                            }
+                        } catch (e) {
+                            console.warn('Failed to parse SSE event', raw, e);
                         }
                     }
                 }
@@ -896,12 +1055,15 @@
                 typingIndicator.classList.remove('active');
             } finally {
                 currentController = null;
+                currentRequestId = null;
+                currentBaseUrl = null;
                 toggleButtons(false);
             }
         }
 
         // Init
         document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('session-id').value = newSessionId();
             fetchModels();
         });
     </script>

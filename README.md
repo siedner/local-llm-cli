@@ -1,10 +1,11 @@
 # local-llm
 
-CLI tool to manage and run local LLMs using **MLX-LM** on macOS Apple Silicon.
+Mac-first local inference manager using the **`mlx-lm` Python API** on Apple Silicon.
 
 Designed for:
 - **MacBook Pro M1 Pro, 32GB RAM**
 - **Mac mini M4, 16GB RAM**
+- **Mac mini / MacBook Pro M4, 32GB RAM**
 
 ## Install
 
@@ -15,6 +16,8 @@ pipx install .
 # Option 2: pip
 pip install .
 ```
+
+Requires Python 3.10 or newer.
 
 ## Quick start
 
@@ -31,11 +34,12 @@ local-llm models install RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4
 # Start a chat
 local-llm chat RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4
 
-# Start a server (foreground)
+# Start the background daemon and warm a model
 local-llm serve start RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4
 
-# Start a server (background)
-local-llm serve start RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4 --detach
+# Inspect daemon/runtime state
+local-llm daemon status
+local-llm ps
 ```
 
 ## Commands
@@ -81,6 +85,7 @@ local-llm profile set m4mini16  # manual override
 ```bash
 local-llm models list              # list installed models
 local-llm models list --disk       # with disk usage
+local-llm models list --no-disk    # skip disk usage
 local-llm models list --json       # JSON output
 local-llm models recommended       # show recommended models
 
@@ -93,21 +98,19 @@ local-llm models remove RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4
 ```bash
 local-llm chat RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4
 local-llm chat RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4 --temp 0.5 --top-p 0.95
+local-llm chat RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4 --session repo-chat --max-context 4096
 ```
 
 ### Serve
 
-Start the MLX-LM OpenAI-compatible server:
+Start the local daemon and warm a model:
 
 ```bash
-# Foreground (default)
-local-llm serve start RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4
-
-# Background
-local-llm serve start RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4 --detach
-
-# Safe mode (reduced concurrency and token limits)
+# Conservative profile-aware limits
 local-llm serve start RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4 --safe
+
+# Override keep-alive/profile
+local-llm serve start RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4 --profile m432 --keep-alive 1200
 
 # Custom port
 local-llm serve start RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4 --port 9090
@@ -137,15 +140,17 @@ OpenCode provider snippet:
   }
 }
 
-Starting server (Ctrl+C to stop)...
+Warm path: reused
 ```
 
-Manage running servers:
+Manage the daemon:
 ```bash
 local-llm serve status              # check if server is running
-local-llm serve stop                # stop server on default port
-local-llm serve stop --port 9090    # stop server on specific port
-local-llm serve options             # show server flags and safe defaults
+local-llm serve stop                # stop the daemon on the default port
+local-llm daemon start              # start daemon explicitly
+local-llm daemon install-launchd    # start at login via launchd
+local-llm serve options             # show runtime defaults and safe operating model
+local-llm logs --follow             # tail daemon logs
 ```
 
 ### OpenCode Integration
@@ -194,7 +199,7 @@ local-llm ssh snippet --to user@mac-mini.local
 
 Config is stored at `~/.config/local-llm/config.json`.
 
-Runtime data (PIDs, logs) is stored at `~/.local/share/local-llm/`.
+Runtime data, logs, and daemon state are stored at `~/.local/share/local-llm/`.
 
 ## Recommended Models
 

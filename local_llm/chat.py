@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+import uuid
 
 from . import ui
 from .config import get_generation_settings
@@ -14,14 +15,19 @@ def chat(
     model: str,
     temp: float | None = None,
     top_p: float | None = None,
-    top_k: int = 50,
+    top_k: int | None = None,
     max_tokens: int | None = None,
+    profile: str | None = None,
+    session: str | None = None,
+    keep_alive_seconds: int | None = None,
+    safe: bool | None = None,
+    max_context: int | None = None,
 ) -> None:
-    """Start an interactive chat session backed by the MLX server.
+    """Start an interactive chat session backed by the local daemon.
 
     Parameters default to the persisted generation settings from config.
-    The server starts automatically on the first message and persists
-    across the session so model weights stay in memory.
+    The daemon starts automatically on the first message and persists
+    across the session so model weights stay warm in memory.
     """
     # Load persisted settings as defaults
     gs = get_generation_settings()
@@ -31,19 +37,25 @@ def chat(
         top_p = gs["top_p"]
     if max_tokens is None:
         max_tokens = gs["max_tokens"]
+    if top_k is None:
+        top_k = gs.get("top_k", 50)
     system_prompt = gs.get("system_prompt", "You are a helpful assistant.")
 
-    if top_k != 50:
-        ui.warning("Note: --top-k is not directly used via the server and will be ignored.")
-
     engine = Engine()
+    session_id = session or f"cli-{uuid.uuid4().hex[:8]}"
     ui.info(f"Chat with {model}")
-    ui.info(f"Settings: temp={temp}  top_p={top_p}  max_tokens={max_tokens}")
+    ui.info(f"Settings: temp={temp}  top_p={top_p}  top_k={top_k}  max_tokens={max_tokens}")
     ui.info("Type your messages.  Ctrl+C or Ctrl+D to exit.\n")
 
     # Start server eagerly so user doesn't wait on the first message
     try:
-        engine.ensure_server(model, on_status=lambda m: ui.info(m))
+        engine.ensure_server(
+            model,
+            profile=profile,
+            keep_alive_seconds=keep_alive_seconds,
+            safe_mode=True if safe is None else safe,
+            on_status=lambda m: ui.info(m),
+        )
     except RuntimeError as e:
         ui.error(str(e))
         return
@@ -76,7 +88,13 @@ def chat(
                 messages,
                 temperature=temp,
                 top_p=top_p,
+                top_k=top_k,
                 max_tokens=max_tokens,
+                session=session_id,
+                max_context=max_context,
+                keep_alive_seconds=keep_alive_seconds,
+                profile=profile,
+                safe=safe,
             ):
                 full_text += chunk
                 sys.stdout.write(chunk)

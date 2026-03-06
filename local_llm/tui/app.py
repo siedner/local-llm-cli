@@ -1,907 +1,1709 @@
-"""Main Textual app for local-llm TUI (Redesigned)."""
+"""Claude-Code-style Textual app for local-llm."""
 
 from __future__ import annotations
 
-import subprocess
-import re
 import shlex
+import subprocess
 import time
-from textual import work
+import uuid
+from pathlib import Path
+import re
+
+from rich.console import Group
+from rich.markdown import Markdown
+from rich.markup import escape
+from rich.panel import Panel
+from rich.text import Text
+from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, VerticalScroll, Horizontal
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.events import Key
 from textual.reactive import reactive
-from textual.widgets import Input, OptionList, Static
+from textual.widgets import OptionList, Static, TextArea
 from textual.widgets.option_list import Option
-from rich.markdown import Markdown
 
 from local_llm import __version__
 from local_llm.config import (
-    get_generation_settings, load_config, save_generation_settings,
+    _default_generation_settings,
+    get_effective_profile,
+    get_generation_settings,
+    get_runtime_settings,
+    get_session_defaults,
+    get_tui_settings,
+    load_config,
+    save_config,
+    save_generation_settings,
+    save_runtime_settings,
+    save_tui_settings,
 )
-from local_llm.constants import (
-    DEFAULT_SYSTEM_PROMPT, GENERATION_PRESETS,
-)
-from local_llm.doctor import get_mlx_python
+from local_llm.constants import DEFAULT_SYSTEM_PROMPT, GENERATION_PRESETS, MODEL_METADATA, RECOMMENDED_MODELS
 from local_llm.engine import Engine
 from local_llm.models import list_models
+from local_llm.tui.commands import CommandSpec, canonical_name, get_command, iter_commands
+from local_llm.tui.custom_commands import CustomCommand, discover_custom_commands
+from local_llm.tui.history import HistoryStore
 
 
-COMMANDS = {
-    "/select": "Select active model for chat/serve",
-    "/models": "List, install, or remove models",
-    "/serve": "Start, stop, or check local MLX server",
-    "/profile": "View or configure hardware profile",
-    "/set": "Configure chat parameters (temp, top_p, max_tokens)",
-    "/doctor": "Check system environment",
-    "/ssh": "Manage SSH tunnels",
-    "/guide": "View setup guides",
-    "/chat": "Start chat directly from input (default behavior without /)",
-    "/clear": "Clear conversation history (model forgets context)",
-    "/copy": "Copy last model response to clipboard",
-    "/quit": "Quit the application",
-}
-
-# Model list cache
-_model_cache: list[dict] | None = None
-_model_cache_ts: float = 0.0
-_MODEL_CACHE_TTL = 30.0  # seconds
+_model_cache: dict[tuple[tuple[str, object], ...], tuple[float, list[dict]]] = {}
+_MODEL_CACHE_TTL = 30.0
+STATUSLINE_FIELDS = ("state", "model", "profile", "session", "safe", "memory", "queue", "warm")
+THINK_RE = re.compile(r"<think>(.*?)(</think>|$)", re.DOTALL)
+REASONING_PREFIXES = (
+    "Thinking Process:",
+    "Thought Process:",
+    "Reasoning:",
+    "Analysis:",
+)
 
 
 def _cached_list_models(**kwargs) -> list[dict]:
-    """Return model list with a cache to avoid filesystem scans on every keystroke."""
-    global _model_cache, _model_cache_ts
+    global _model_cache
+    key = tuple(sorted(kwargs.items()))
     now = time.time()
-    if _model_cache is not None and (now - _model_cache_ts) < _MODEL_CACHE_TTL:
-        return _model_cache
-    _model_cache = list_models(**kwargs)
-    _model_cache_ts = now
-    return _model_cache
+    cached = _model_cache.get(key)
+    if cached and (now - cached[0]) < _MODEL_CACHE_TTL:
+        return cached[1]
+    models = list_models(**kwargs)
+    _model_cache[key] = (now, models)
+    return models
 
 
 def _invalidate_model_cache() -> None:
-    global _model_cache, _model_cache_ts
-    _model_cache = None
-    _model_cache_ts = 0.0
+    global _model_cache
+    _model_cache = {}
+
+
+def _split_assistant_sections(text: str) -> tuple[str, str]:
+    """Split assistant text into reasoning and final answer sections."""
+    text = text.strip()
+    if not text:
+        return "", ""
+
+    explicit = THINK_RE.search(text)
+    if explicit:
+        thinking = explicit.group(1).strip()
+        answer = (text[:explicit.start()] + text[explicit.end():]).strip()
+        return thinking, answer
+
+    stripped = text.lstrip()
+    if stripped.startswith(REASONING_PREFIXES):
+        chunks = [chunk.strip() for chunk in re.split(r"\n\s*\n", stripped) if chunk.strip()]
+        if len(chunks) >= 2:
+            return "\n\n".join(chunks[:-1]), chunks[-1]
+        return stripped, ""
+
+    return "", text
+
+
+def _clean_thinking_text(text: str) -> str:
+    """Normalize reasoning text before rendering."""
+    text = text.replace("<think>", "").replace("</think>", "").strip()
+    for prefix in REASONING_PREFIXES:
+        if text.startswith(prefix):
+            text = text[len(prefix):].lstrip()
+            break
+    return text.strip()
+
+
+def _render_assistant_text(text: str, *, final: bool) -> Group | Markdown | Text:
+    """Render assistant output with a distinct muted block for reasoning sections."""
+    thinking, answer = _split_assistant_sections(text)
+    parts: list[object] = []
+    if thinking:
+        thinking = _clean_thinking_text(thinking)
+        parts.append(
+            Panel(
+                Markdown(thinking) if final else Text(thinking, style="italic #7d8590"),
+                title="Thinking",
+                title_align="left",
+                style="dim italic",
+                border_style="#30363d",
+                padding=(0, 1),
+            )
+        )
+    if answer:
+        parts.append(Markdown(answer) if final else Text(answer))
+
+    if not parts:
+        return Text("")
+    if len(parts) == 1:
+        return parts[0]
+    return Group(*parts)
+
+
+class Composer(TextArea):
+    """Multiline composer with explicit submit/navigation actions."""
+
+    BINDINGS = [
+        Binding("enter", "submit", "Submit", show=False),
+        Binding("ctrl+j", "newline", "Newline", show=False),
+        Binding("alt+enter", "newline", "Newline", show=False),
+        Binding("up", "history_up", "History up", show=False),
+        Binding("down", "history_down", "History down", show=False),
+        Binding("escape", "escape_key", "Escape", show=False),
+    ]
+
+    def action_submit(self) -> None:
+        self.app.composer_submit()
+
+    def action_newline(self) -> None:
+        self.app.composer_newline()
+
+    def action_history_up(self) -> None:
+        if not self.app.composer_history_up():
+            self.action_cursor_up()
+
+    def action_history_down(self) -> None:
+        if not self.app.composer_history_down():
+            self.action_cursor_down()
+
+    def action_escape_key(self) -> None:
+        self.app.composer_escape()
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "enter":
+            self.action_submit()
+            event.stop()
+        elif event.key in {"ctrl+j", "alt+enter"}:
+            self.action_newline()
+            event.stop()
+        elif event.key == "up":
+            self.action_history_up()
+            event.stop()
+        elif event.key == "down":
+            self.action_history_down()
+            event.stop()
+        elif event.key == "escape":
+            self.action_escape_key()
+            event.stop()
 
 
 class CommandPalette(App):
-    """Interactive Command-Palette style TUI for local-llm."""
+    """Keyboard-first TUI for managing and chatting with local-llm."""
 
     TITLE = "local-llm"
     SUB_TITLE = f"v{__version__}"
 
     CSS = """
     Screen {
-        background: transparent;
         layout: vertical;
+        background: #081123;
+        color: #f5f7fa;
     }
 
-    #log-area {
+    #transcript {
         height: 1fr;
-        padding: 0 1;
-        margin: 0 0 1 0;
-        background: transparent;
-        overflow-y: scroll;
-    }
-
-    #bottom-bar {
-        dock: bottom;
-        width: 100%;
-        height: auto;
+        padding: 1 2;
         background: transparent;
     }
 
-    #input-container {
-        width: 100%;
-        height: 1;
-        padding: 0;
-        margin: 0;
-    }
-
-    #prompt-icon {
-        color: #55ff55;
-        text-style: bold;
-        width: 3;
-        content-align: center middle;
-    }
-
-    #command-input {
-        width: 1fr;
-        border: none;
-        background: transparent;
-        padding: 0;
-        margin: 0;
-    }
-
-    #command-input:focus {
-        border: none;
-    }
-
-    #dropdown-container {
+    #drawer {
+        height: 12;
         display: none;
-        height: auto;
-        max-height: 10;
-        margin: 0 0 1 3;
-        background: transparent;
-        border: none;
+        border-top: solid #22314d;
+        background: #0d1830;
     }
-    
-    #dropdown-container.-visible {
+
+    #drawer.-visible {
         display: block;
     }
 
-    #command-dropdown {
-        width: 100%;
-        height: auto;
-        max-height: 9;
+    #drawer-list {
+        width: 45%;
+        height: 100%;
+        border-right: solid #22314d;
         background: transparent;
-        border: none;
-        padding: 0;
-        scrollbar-size: 0 0;
-    }
-    
-    #command-dropdown:focus > .option-list--option-highlighted {
-        background: #333333;
-        text-style: bold;
-    }
-    
-    #command-dropdown:focus {
-        border: none;
     }
 
-    #activity-indicator {
-        dock: bottom;
-        margin-bottom: 1;
-        content-align: left middle;
-        width: 100%;
+    #drawer-details {
+        width: 55%;
+        padding: 1 2;
+        color: #c4d0e3;
+    }
+
+    #composer-shell {
+        height: auto;
+        border-top: solid #22314d;
+        padding: 0 1 0 1;
+        background: #0b1528;
+    }
+
+    #composer-header {
+        height: auto;
+        padding: 0 1;
+        color: #8ba0c2;
+    }
+
+    #command-context {
+        display: none;
+        height: auto;
+        padding: 0 1;
+        color: #c4d0e3;
+    }
+
+    #command-context.-active {
+        display: block;
+    }
+
+    #composer-mode {
+        color: #58a6ff;
+        text-style: bold;
+    }
+
+    #composer {
+        height: 4;
+        min-height: 3;
+        max-height: 6;
+        border: round #22314d;
+        background: #09101f;
+    }
+
+    #composer-hints {
+        padding: 0 1;
+        color: #8ba0c2;
+        height: auto;
+    }
+
+    #activity {
+        padding: 0 1;
+        color: #58a6ff;
+        text-style: bold;
+        display: none;
+    }
+
+    #activity.-active {
+        display: block;
+    }
+
+    #statusline {
         height: 1;
         padding: 0 1;
-        color: #55ff55;
-        text-style: bold;
-        layer: overlay;
-        display: none;
-        background: transparent;
-    }
-    
-    #activity-indicator.-active {
-        display: block;
+        background: #060d19;
+        color: #9eb0cc;
     }
 
     .system-msg {
-        color: #888888;
-        text-style: italic;
+        color: #98a8c4;
     }
+
     .user-msg {
-        color: #ffffff;
+        color: #f5f7fa;
         text-style: bold;
     }
+
     .error-msg {
-        color: #ff5555;
+        color: #ff7b72;
         text-style: bold;
+    }
+
+    .summary-msg {
+        color: #8ba0c2;
     }
     """
 
     BINDINGS = [
-        Binding("ctrl+c", "quit", "Quit"),
-        Binding("ctrl+l", "clear_log", "Clear"),
+        Binding("/", "focus_composer_command", "Command", show=False),
+        Binding("ctrl+d", "quit", "Quit"),
+        Binding("ctrl+c", "interrupt", "Cancel"),
+        Binding("ctrl+l", "clear_transcript", "Clear"),
         Binding("ctrl+y", "copy_last", "Copy"),
-        Binding("escape", "dismiss", "Dismiss", show=False),
-        Binding("tab", "cycle_focus", "Focus", show=False),
-        Binding("down", "focus_dropdown", "Options", show=False),
-        Binding("up", "focus_log", "Log", show=False),
+        Binding("ctrl+r", "refresh_runtime", "Refresh"),
+        Binding("pageup", "transcript_page_up", "Scroll Up", show=False),
+        Binding("pagedown", "transcript_page_down", "Scroll Down", show=False),
+        Binding("home", "transcript_home", "Top", show=False),
+        Binding("end", "transcript_end", "Bottom", show=False),
+        Binding("ctrl+up", "transcript_line_up", "Line Up", show=False),
+        Binding("ctrl+down", "transcript_line_down", "Line Down", show=False),
+        Binding("tab", "focus_next", "Focus", show=False),
+        Binding("shift+tab", "focus_previous", "Focus", show=False),
     ]
 
     selected_model: reactive[str] = reactive("")
     _last_response: str = ""
 
-    # Conversation history (OpenAI messages format)
-    _chat_history: list[dict] = []
+    def __init__(self) -> None:
+        super().__init__()
+        self._engine: Engine | None = None
+        self._chat_history: list[dict] = []
+        self._session_id = ""
+        self._generation_inflight = False
+        self._spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self._spinner_idx = 0
+        self._spinner_timer = None
+        self._drawer_entries: dict[str, dict] = {}
+        self._runtime_snapshot: dict = {}
+        self._snapshot_refresh_inflight = False
+        self._last_escape_at = 0.0
+        self._last_user_prompt = ""
+        self._history: HistoryStore | None = None
+        self._custom_commands: dict[str, CustomCommand] = {}
+        self._tui_settings: dict = {}
 
-    # Generation parameters (loaded from config on mount)
-    gen_temp: float = 0.7
-    gen_top_p: float = 0.9
-    gen_max_tokens: int = 2048
-    gen_preset: str = "balanced"
-    gen_system_prompt: str = DEFAULT_SYSTEM_PROMPT
-
-    # Engine instance (created on mount)
-    _engine: Engine | None = None
-
-    # Spinner state
-    _spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-    _spinner_idx = 0
-    _spinner_timer = None
-
-    def start_thinking(self) -> None:
-        indicator = self.query_one("#activity-indicator", Static)
-        indicator.add_class("-active")
-        if self._spinner_timer is None:
-            self._spinner_timer = self.set_interval(0.1, self._update_spinner)
-
-    def stop_thinking(self) -> None:
-        indicator = self.query_one("#activity-indicator", Static)
-        indicator.remove_class("-active")
-        if self._spinner_timer is not None:
-            self._spinner_timer.pause()
-            self._spinner_timer = None
-
-    def _update_spinner(self) -> None:
-        self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_frames)
-        self.query_one("#activity-indicator", Static).update(self._spinner_frames[self._spinner_idx])
+        self.gen_temp = 0.7
+        self.gen_top_p = 0.9
+        self.gen_top_k = 50
+        self.gen_max_tokens = 1024
+        self.gen_preset = "balanced"
+        self.gen_system_prompt = DEFAULT_SYSTEM_PROMPT
+        self.runtime_max_context: int | None = None
+        self.runtime_keep_alive: int | None = None
+        self.runtime_safe = True
+        self._profile_name = "auto"
 
     def compose(self) -> ComposeResult:
-        yield Static("", id="activity-indicator")
-        with VerticalScroll(id="log-area"):
-             pass
-        
-        from textual.containers import Vertical
-        with Vertical(id="bottom-bar"):
-            with Horizontal(id="input-container"):
-                yield Static("❯", id="prompt-icon")
-                yield Input(placeholder="Ask a question or type '/' for commands...", id="command-input")
-                
-            with Container(id="dropdown-container"):
-                yield OptionList(id="command-dropdown")
+        with VerticalScroll(id="transcript"):
+            pass
+        with Horizontal(id="drawer"):
+            yield OptionList(id="drawer-list")
+            yield Static("", id="drawer-details")
+        with Vertical(id="composer-shell"):
+            yield Static("", id="composer-header")
+            yield Static("", id="command-context")
+            yield Composer("", id="composer")
+            yield Static("", id="composer-hints")
+            yield Static("", id="activity")
+        yield Static("", id="statusline")
 
     def on_mount(self) -> None:
         self._engine = Engine()
+        self._session_id = f"tui-{uuid.uuid4().hex[:8]}"
         self._chat_history = []
 
-        # Load persisted generation settings
-        gs = get_generation_settings()
-        self.gen_temp = gs["temp"]
-        self.gen_top_p = gs["top_p"]
-        self.gen_max_tokens = gs["max_tokens"]
-        self.gen_preset = gs.get("preset", "balanced")
-        self.gen_system_prompt = gs.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+        config = load_config()
+        generation = get_generation_settings(config)
+        runtime = get_runtime_settings(config)
+        session_defaults = get_session_defaults(config)
+        self._tui_settings = get_tui_settings(config)
+        self._profile_name, _profile = get_effective_profile(config)
 
-        self.query_one("#command-input").focus()
-        self.log_msg(f"[bold]local-llm v{__version__}[/] initialized. Type [bold]/[/] for commands.", style="system-msg")
+        self.gen_temp = generation["temp"]
+        self.gen_top_p = generation["top_p"]
+        self.gen_top_k = generation["top_k"]
+        self.gen_max_tokens = generation["max_tokens"]
+        self.gen_preset = generation["preset"]
+        self.gen_system_prompt = generation["system_prompt"]
+        self.runtime_max_context = session_defaults.get("max_context")
+        self.runtime_keep_alive = session_defaults.get("keep_alive_seconds")
+        self.runtime_safe = bool(runtime.get("safe_mode", True))
+
+        self._history = HistoryStore(Path.cwd(), limit=int(self._tui_settings.get("history_size", 100)))
+        self._custom_commands = discover_custom_commands()
+
+        self.query_one("#composer", Composer).focus()
+        self.log_msg(f"[bold]local-llm v{__version__}[/] ready. Type [bold]/[/] for commands.", style="system-msg")
         self.log_msg(
-            "[dim]Ctrl+Y copy last response · Ctrl+L clear log · /clear reset history · Tab cycle focus[/]",
+            "[dim]Ctrl+C cancel generation · Ctrl+D quit · Ctrl+J / Option+Enter newline · Esc Esc edit previous prompt[/]",
+            style="system-msg",
+        )
+        self.log_msg(
+            "[dim]Slash commands are discoverable in the drawer. Old aliases like /select, /set, /serve, and /ps still work.[/]",
             style="system-msg",
         )
 
-        # Recover an already-running server
-        running = self._engine.get_running_model()
+        running = self._engine.get_running_model() if self._engine else None
         if running:
             self.selected_model = running
-            self.log_msg(f"Recovered running server: [bold]{running}[/]", style="system-msg")
-            return
-
-        # Auto-select a model
-        config = load_config()
-        favs = config.get("favorite_models", [])
-        if favs:
-            self.selected_model = favs[0]
-            self.log_msg(f"Auto-selected favorite model: [bold]{self.selected_model}[/]", style="system-msg")
+            self.log_msg(f"Recovered warm runtime: [bold]{running}[/]", style="system-msg")
         else:
-            models = _cached_list_models()
-            if models:
-                self.selected_model = models[0]['repo']
-                self.log_msg(f"Auto-selected first available model: [bold]{self.selected_model}[/]", style="system-msg")
+            favorites = config.get("favorite_models", [])
+            if favorites:
+                self.selected_model = favorites[0]
+                self.log_msg(f"Auto-selected favorite model: [bold]{self.selected_model}[/]", style="system-msg")
+            else:
+                models = _cached_list_models()
+                if models:
+                    self.selected_model = models[0]["repo"]
+                    self.log_msg(f"Auto-selected first available model: [bold]{self.selected_model}[/]", style="system-msg")
 
-    def log_msg(self, msg: str, style: str = "") -> None:
-        log = self.query_one("#log-area", VerticalScroll)
-        # Use classes for coloring; only escape if we're not explicitly intending rich tags like [bold]
-        # But for general log_msg, it may contain [bold], so we leave it as is.
-        widget = Static(msg, classes=style)
+        self._render_composer_header()
+        self._render_command_context()
+        self._render_composer_hints()
+        self._render_statusline()
+        self.set_interval(3.0, self._queue_runtime_refresh)
+        self._queue_runtime_refresh()
+
+    def log_msg(self, message: str, style: str = "") -> None:
+        log = self.query_one("#transcript", VerticalScroll)
+        widget = Static(message, classes=style)
         log.mount(widget)
         log.scroll_end(animate=False)
 
-    def action_clear_log(self) -> None:
-        self.query_one("#log-area", VerticalScroll).remove_children()
+    def action_clear_transcript(self) -> None:
+        self.query_one("#transcript", VerticalScroll).remove_children()
+        self.log_msg("Transcript cleared.", style="system-msg")
 
     def action_copy_last(self) -> None:
-        """Copy the last model response to the system clipboard."""
         if not self._last_response:
             self.log_msg("Nothing to copy yet.", style="system-msg")
             return
         try:
             subprocess.run(["pbcopy"], input=self._last_response.encode(), check=True)
             self.log_msg("Copied last response to clipboard.", style="system-msg")
-        except Exception as e:
-            self.log_msg(f"Copy failed: {e}", style="error-msg")
+        except Exception as exc:
+            self.log_msg(f"Copy failed: {exc}", style="error-msg")
 
-    def action_dismiss(self) -> None:
-        """Dismiss the dropdown and refocus input."""
-        self.query_one("#dropdown-container").remove_class("-visible")
-        self.query_one("#command-input", Input).focus()
-
-    def action_cycle_focus(self) -> None:
-        """Cycle focus: input → dropdown (if visible) → log → input."""
-        focused = self.focused
-        inp = self.query_one("#command-input", Input)
-        dropdown = self.query_one("#command-dropdown", OptionList)
-        log_area = self.query_one("#log-area", VerticalScroll)
-        container = self.query_one("#dropdown-container")
-
-        if focused == inp:
-            if container.has_class("-visible"):
-                dropdown.focus()
-            else:
-                log_area.focus()
-        elif focused == dropdown:
-            log_area.focus()
-        else:
-            inp.focus()
-
-    def action_focus_dropdown(self) -> None:
-        dropdown = self.query_one("#command-dropdown", OptionList)
-        container = self.query_one("#dropdown-container")
-        if container.has_class("-visible") and dropdown.option_count > 0:
-            dropdown.focus()
-            if dropdown.highlighted is None:
-                dropdown.highlighted = 0
-            
-    def action_focus_log(self) -> None:
-        self.query_one("#log-area").focus()
-
-    # --- Dropdown Logic ---
-
-    def _populate_dropdown(self, filter_text: str = "") -> None:
-        dropdown = self.query_one("#command-dropdown", OptionList)
-        dropdown.clear_options()
-        
-        search = filter_text.lower().lstrip()
-        parts = search.split(" ", 1)
-        base_cmd = parts[0]
-        
-        if base_cmd == "/models" and len(parts) > 1:
-            sub = parts[1].lstrip()
-            actions = {
-                "list": "Show installed models",
-                "install": "Download a model",
-                "remove": "Delete a model",
-                "scan": "Scan system for all LLM weights",
-            }
-            action_match = next((a for a in actions if sub.startswith(a + " ") or sub == a), None)
-            
-            if action_match in ["install", "remove"]:
-                from local_llm.constants import RECOMMENDED_MODELS
-                term = sub[len(action_match):].strip()
-                options = list_models(disk=True, filter_relevant=False) if action_match != "install" else RECOMMENDED_MODELS
-                added = 0
-                for item in options:
-                    repo = item["repo"]
-                    if not term or term in repo.lower():
-                        if action_match == "install":
-                            display = f"[cyan]{repo}[/cyan] [dim italic]{item.get('estimated_size', 'unknown')}[/] [dim]- {item.get('description', '')}[/]"
-                        else:
-                            display = f"[cyan]{repo}[/cyan] [dim italic]{item.get('disk_usage', 'unknown')}[/]"
-                        dropdown.add_option(Option(display, id=f"/models {action_match} {repo}"))
-                        added += 1
-                if added == 0:
-                     dropdown.add_option(Option(f"Press enter to {action_match}{' ' + term if term else ''}", id=f"/models {action_match} {term}"))
-            else:
-                added = 0
-                for a, desc in actions.items():
-                    if not sub or a.startswith(sub):
-                        dropdown.add_option(Option(f"[white]{a}[/white] [dim]- {desc}[/dim]", id=f"/models {a} "))
-                        added += 1
-                if added == 0:
-                     dropdown.add_option(Option(f"Press enter to execute: [white]/models {sub}[/white]", id=f"/models {sub}"))
-                     
-        elif base_cmd == "/select" and len(parts) > 1:
-            sub = parts[1].lstrip()
-            options = _cached_list_models(disk=True, filter_relevant=False)
-            added = 0
-            for item in options:
-                repo = item["repo"]
-                if not sub or sub in repo.lower():
-                    dropdown.add_option(Option(f"[cyan]{repo}[/cyan] [dim italic]{item.get('disk_usage', 'unknown')}[/]", id=f"/select {repo}"))
-                    added += 1
-            if added == 0:
-                dropdown.add_option(Option(f"Press enter to select: [cyan]{sub}[/cyan]", id=f"/select {sub}"))
-                     
-        elif base_cmd == "/serve" and len(parts) > 1:
-            sub = parts[1].lstrip()
-            added = 0
-            for action in ["start", "stop", "status"]:
-                if not sub or action.startswith(sub):
-                    dropdown.add_option(Option(action, id=f"/serve {action} "))
-                    added += 1
-            if added == 0:
-                dropdown.add_option(Option(f"Press enter to execute: /serve {sub}", id=f"/serve {sub}"))
-                    
-        elif base_cmd == "/profile" and len(parts) > 1:
-            sub = parts[1].lstrip()
-            added = 0
-            for action in ["auto", "current", "list", "set"]:
-                if not sub or action.startswith(sub):
-                    dropdown.add_option(Option(action, id=f"/profile {action} "))
-                    added += 1
-            if added == 0:
-                dropdown.add_option(Option(f"Press enter to execute: /profile {sub}", id=f"/profile {sub}"))
-                    
-        elif base_cmd == "/set" and len(parts) > 1:
-            sub = parts[1].lstrip()
-            sub_parts = sub.split(" ", 1)
-            sub_cmd = sub_parts[0]
-
-            # Show presets if typing "/set preset"
-            if sub_cmd == "preset" or "preset".startswith(sub_cmd):
-                if len(sub_parts) > 1:
-                    filter_text = sub_parts[1].strip()
-                else:
-                    filter_text = ""
-                added = 0
-                for name, info in GENERATION_PRESETS.items():
-                    if not filter_text or filter_text in name:
-                        marker = " ✓" if name == self.gen_preset else ""
-                        dropdown.add_option(Option(
-                            f"[cyan]{name}[/cyan] [dim]— {info['description']}[/dim]{marker}",
-                            id=f"/set preset {name}"
-                        ))
-                        added += 1
-                if added == 0:
-                    dropdown.add_option(Option(f"Unknown preset: {filter_text}", id=f"/set preset {filter_text}"))
-            else:
-                added = 0
-                settings_list = [
-                    ("preset", self.gen_preset),
-                    ("temp", self.gen_temp),
-                    ("top_p", self.gen_top_p),
-                    ("max_tokens", self.gen_max_tokens),
-                    ("system_prompt", self.gen_system_prompt[:40] + ("…" if len(self.gen_system_prompt) > 40 else "")),
-                    ("reset", "restore defaults"),
-                ]
-                for k, cur in settings_list:
-                    if not sub or k.startswith(sub):
-                        dropdown.add_option(Option(f"[white]{k}[/white] [dim](current: {cur})[/dim]", id=f"/set {k} "))
-                        added += 1
-                if added == 0:
-                    dropdown.add_option(Option(f"Press enter to execute: [white]/set {sub}[/white]", id=f"/set {sub}"))
-                
-        elif base_cmd == "/ssh" and len(parts) > 1:
-            sub = parts[1].lstrip()
-            added = 0
-            for action in ["status", "stop", "tunnel", "snippet"]:
-                if not sub or action.startswith(sub):
-                    dropdown.add_option(Option(action, id=f"/ssh {action} "))
-                    added += 1
-            if added == 0:
-                dropdown.add_option(Option(f"Press enter to execute: /ssh {sub}", id=f"/ssh {sub}"))
-                    
-        elif base_cmd == "/guide" and len(parts) > 1:
-            sub = parts[1].lstrip()
-            if not sub or "opencode".startswith(sub):
-                 dropdown.add_option(Option("opencode", id="/guide opencode "))
-            else:
-                 dropdown.add_option(Option(f"Press enter to execute: /guide {sub}", id=f"/guide {sub}"))
-                
-        else:
-            # Base command autocomplete
-            added = 0
-            for cmd, desc in COMMANDS.items():
-                if cmd.lower().startswith(search) or (search and search in desc.lower()):
-                    dropdown.add_option(Option(f"[white]{cmd}[/white] [dim]- {desc}[/dim]", id=cmd + " "))
-                    added += 1
-            if added == 0 and search.startswith("/"):
-                dropdown.add_option(Option(f"Press enter to execute: [white]{search}[/white]", id=search))
-
-        dropdown.highlighted = None
-
-    def on_input_changed(self, event: Input.Changed) -> None:
-        val = event.value
-        container = self.query_one("#dropdown-container")
-        
-        if val.startswith("/"):
-            container.add_class("-visible")
-            self._populate_dropdown(val)
-        else:
-            container.remove_class("-visible")
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        val = event.value.strip()
-        if not val:
+    def action_interrupt(self) -> None:
+        if not self._generation_inflight:
+            self.log_msg("No active generation to cancel.", style="system-msg")
             return
-            
-        container = self.query_one("#dropdown-container")
-        dropdown = self.query_one("#command-dropdown", OptionList)
-        
-        # Quick submit if dropdown visible and input matches exactly, or nothing typed, etc.
-        # It's cleaner to read the input value directly here.
-        event.input.value = ""
-        container.remove_class("-visible")
-        
-        if val.startswith("/"):
-            self._handle_command(val)
+        self.log_msg("Cancelling active generation…", style="system-msg")
+        self._cancel_active_request()
+
+    def action_refresh_runtime(self) -> None:
+        self._queue_runtime_refresh()
+
+    def action_transcript_page_up(self) -> None:
+        self.query_one("#transcript", VerticalScroll).scroll_page_up(animate=False)
+
+    def action_transcript_page_down(self) -> None:
+        self.query_one("#transcript", VerticalScroll).scroll_page_down(animate=False)
+
+    def action_transcript_home(self) -> None:
+        self.query_one("#transcript", VerticalScroll).scroll_home(animate=False)
+
+    def action_transcript_end(self) -> None:
+        self.query_one("#transcript", VerticalScroll).scroll_end(animate=False)
+
+    def action_transcript_line_up(self) -> None:
+        self.query_one("#transcript", VerticalScroll).scroll_up(animate=False)
+
+    def action_transcript_line_down(self) -> None:
+        self.query_one("#transcript", VerticalScroll).scroll_down(animate=False)
+
+    def start_thinking(self) -> None:
+        activity = self.query_one("#activity", Static)
+        activity.add_class("-active")
+        if self._spinner_timer is None:
+            self._spinner_timer = self.set_interval(0.1, self._update_spinner)
+
+    def stop_thinking(self) -> None:
+        activity = self.query_one("#activity", Static)
+        activity.remove_class("-active")
+        if self._spinner_timer is not None:
+            self._spinner_timer.pause()
+            self._spinner_timer = None
+
+    def _update_spinner(self) -> None:
+        self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_frames)
+        self.query_one("#activity", Static).update(f"{self._spinner_frames[self._spinner_idx]} Working…")
+
+    @property
+    def composer(self) -> Composer:
+        return self.query_one("#composer", Composer)
+
+    def _composer_text(self) -> str:
+        return self.composer.text
+
+    def _set_composer_text(self, value: str) -> None:
+        self.composer.load_text(value)
+        lines = value.splitlines() or [""]
+        self.composer.move_cursor((len(lines) - 1, len(lines[-1])))
+        self._render_composer_header()
+        self._render_command_context()
+        self._render_composer_hints()
+        self._refresh_drawer()
+
+    def _clear_composer(self) -> None:
+        self._set_composer_text("")
+
+    def _render_composer_header(self) -> None:
+        mode = "command" if self._composer_text().lstrip().startswith("/") else "chat"
+        selected = self.selected_model or "none"
+        self.query_one("#composer-header", Static).update(
+            f"[bold]mode[/]: {mode}   [bold]model[/]: {selected}   [bold]profile[/]: {self._profile_name}   [bold]session[/]: {self._session_id}"
+        )
+
+    def _render_command_context(self) -> None:
+        widget = self.query_one("#command-context", Static)
+        markup = self._command_context_markup()
+        if markup:
+            widget.update(markup)
+            widget.add_class("-active")
         else:
-            self.log_msg(f"You: {val}", style="user-msg")
-            self._handle_chat(val)
+            widget.update("")
+            widget.remove_class("-active")
 
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        command = str(event.option.id)
-        inp = self.query_one("#command-input", Input)
-        container = self.query_one("#dropdown-container")
-        
-        if command.startswith("/models install ") or command.startswith("/models remove ") or command.startswith("/serve ") or command.startswith("/set ") or command.startswith("/select "):
-            inp.value = command
-            inp.cursor_position = len(inp.value)
-            container.add_class("-visible")
-            self._populate_dropdown(command)
-            inp.focus()
-        elif command.startswith("/models") and command.strip() == "/models":
-            inp.value = "/models "
-            inp.cursor_position = len(inp.value)
-            self._populate_dropdown("/models ")
-            inp.focus()
-        else:
-             inp.value = ""
-             container.remove_class("-visible")
-             self._handle_command(command)
-             inp.focus()
+    def _command_context_markup(self) -> str:
+        text = self._composer_text().strip()
+        if not text.startswith("/"):
+            return ""
 
-    # --- Command Routing ---
-
-    def _handle_command(self, cmd_string: str) -> None:
-        try:
-            parts = shlex.split(cmd_string)
-        except ValueError:
-            parts = [cmd_string]
-            
-        cmd = parts[0]
+        parts = text.split()
+        command = canonical_name(parts[0])
         args = parts[1:]
-        
-        if cmd in ["/quit", "/q", "exit", "quit" ]:
-            self.exit()
-            
-        elif cmd == "/doctor":
-            self.log_msg("Running Doctor checks...", style="system-msg")
-            self._run_cli_command(["doctor"] + args)
-            
-        elif cmd == "/select":
-            if not args:
-                self.log_msg("Usage: /select <repo>", style="error-msg")
-                return
-            repo = args[0]
-            self.selected_model = repo
-            self._chat_history = []  # reset history on model change
-            self.log_msg(f"Selected model: [bold]{repo}[/]", style="system-msg")
-            self._ensure_server_for_model(repo)
-            
-        elif cmd == "/serve":
-            action = args[0] if args else "start"
-            flags = args[1:] if args else []
-            
-            if action == "stop":
-                self._run_cli_command(["serve", "stop"] + flags)
-            elif action == "status":
-                self._run_cli_command(["serve", "status"] + flags)
-            else:
-                if not self.selected_model:
-                    self.log_msg("Error: Select a model first using /models before starting the server", style="error-msg")
-                    return
-                # Default to detached unless they provide --no-detach
-                detached_flags = []
-                if "--no-detach" in flags:
-                    flags.remove("--no-detach")
-                elif "--detach" not in flags:
-                    detached_flags.append("--detach")
-                    
-                self.log_msg(f"Starting server for {self.selected_model}...", style="system-msg")
-                self._run_cli_command(["serve", "start", self.selected_model] + detached_flags + flags)
-            
-        elif cmd == "/models":
-            action = args[0] if args else "list"
-            flags = args[1:] if args else []
-            
-            if action == "list":
-                _invalidate_model_cache()  # force fresh scan
-                self.log_msg("Installed models:", style="system-msg")
-                self._run_cli_command(["models", "list"] + flags)
-            elif action == "scan":
-                self._run_cli_command(["models", "scan"])
-            elif action == "install":
-                if not flags:
-                    self.log_msg("Usage: /models install <repo>", style="error-msg")
-                    return
-                repo = flags[0]
-                _invalidate_model_cache()  # new model coming
-                self.log_msg(f"Installing {repo}...", style="system-msg")
-                self._run_cli_command(["models", "install", repo, "-y"])
-            elif action == "remove":
-                if not flags:
-                    self.log_msg("Usage: /models remove <repo>", style="error-msg")
-                    return
-                repo = flags[0]
-                _invalidate_model_cache()  # model leaving
-                self._run_cli_command(["models", "remove", repo, "-y"])
-            else:
-                 self.log_msg(f"Unknown /models subcommand: {action}", style="error-msg")
 
-        elif cmd == "/profile":
-            action = args[0] if args else "current"
-            flags = args[1:] if args else []
-            self._run_cli_command(["profile", action] + flags)
-            
-        elif cmd == "/set":
+        if command == "/models":
             if not args:
-                # Show settings summary
-                self._show_settings_summary()
-                return
-            param = args[0].lower()
-            val = " ".join(args[1:]) if len(args) > 1 else ""
-
-            if param == "preset":
-                if val not in GENERATION_PRESETS:
-                    names = ", ".join(GENERATION_PRESETS.keys())
-                    self.log_msg(f"Unknown preset '{val}'. Available: {names}", style="error-msg")
-                    return
-                p = GENERATION_PRESETS[val]
-                self.gen_preset = val
-                self.gen_temp = p["temp"]
-                self.gen_top_p = p["top_p"]
-                self.gen_max_tokens = p["max_tokens"]
-                self._persist_gen_settings()
-                self.log_msg(
-                    f"Applied preset [bold]{val}[/]: temp={p['temp']}  top_p={p['top_p']}  max_tokens={p['max_tokens']}",
-                    style="system-msg",
+                return "[bold]/models[/]  [dim]→ choose an action: list, install, warm, remove, verify, repair, prune[/dim]"
+            action = args[0]
+            if action == "install":
+                if len(args) == 1:
+                    return (
+                        "[bold]/models[/] [dim]›[/] [bold]install[/]  [cyan]waiting for <repo>[/cyan]\n"
+                        "[dim]Paste a Hugging Face repo or choose a curated install target from the drawer.[/dim]"
+                    )
+                return (
+                    f"[bold]/models[/] [dim]›[/] [bold]install[/] [cyan]{escape(args[1])}[/cyan]\n"
+                    "[dim]Press Enter to install this repo.[/dim]"
+                )
+            if action in {"remove", "verify", "repair", "warm"}:
+                target = args[1] if len(args) > 1 else (self.selected_model or "<repo>")
+                return (
+                    f"[bold]/models[/] [dim]›[/] [bold]{escape(action)}[/] [cyan]{escape(target)}[/cyan]\n"
+                    "[dim]Choose an installed model from the drawer or type its full repo id.[/dim]"
                 )
 
-            elif param == "reset":
-                from local_llm.config import _default_generation_settings
-                defaults = _default_generation_settings()
-                self.gen_preset = defaults["preset"]
-                self.gen_temp = defaults["temp"]
-                self.gen_top_p = defaults["top_p"]
-                self.gen_max_tokens = defaults["max_tokens"]
-                self.gen_system_prompt = defaults["system_prompt"]
-                self._persist_gen_settings()
-                self.log_msg("Settings reset to defaults.", style="system-msg")
-                self._show_settings_summary()
+        if command == "/model":
+            if len(args) == 0:
+                return "[bold]/model[/]  [cyan]waiting for <installed-repo>[/cyan]\n[dim]Pick one installed model to make it the active chat target.[/dim]"
+            return f"[bold]/model[/] [cyan]{escape(args[0])}[/cyan]\n[dim]Press Enter to select this model and reset the chat session.[/dim]"
 
-            elif param == "system_prompt":
-                if not val:
-                    self.log_msg(f"Current system prompt: {self.gen_system_prompt}", style="system-msg")
-                    return
-                self.gen_system_prompt = val
-                self._persist_gen_settings()
-                self.log_msg(f"System prompt updated.", style="system-msg")
+        if command == "/runtime":
+            action = args[0] if args else "start"
+            target = args[1] if len(args) > 1 and not args[1].startswith("-") else (self.selected_model or "selected-model")
+            if action == "start":
+                return f"[bold]/runtime[/] [dim]›[/] [bold]start[/] [cyan]{escape(target)}[/cyan]\n[dim]Press Enter to warm or restart the daemon runtime for this model.[/dim]"
+            return f"[bold]/runtime[/] [dim]›[/] [bold]{escape(action)}[/]\n[dim]Press Enter to run this runtime action.[/dim]"
 
-            else:
-                if not val:
-                    self.log_msg(f"Usage: /set {param} <value>", style="error-msg")
-                    return
-                try:
-                    if param == "temp":
-                        self.gen_temp = float(val)
-                    elif param == "top_p":
-                        self.gen_top_p = float(val)
-                    elif param == "max_tokens":
-                        self.gen_max_tokens = int(val)
-                    else:
-                        self.log_msg(f"Unknown parameter '{param}'. Try: /set", style="error-msg")
-                        return
-                    self.gen_preset = "custom"
-                    self._persist_gen_settings()
-                    self.log_msg(f"Set [bold]{param}[/] to {val}  (preset → custom)", style="system-msg")
-                except ValueError:
-                    self.log_msg(f"Invalid value for {param}: {val}", style="error-msg")
-            
-        elif cmd == "/chat":
-            if not self.selected_model:
-                self.log_msg("Error: Select a model first using /models", style="error-msg")
-                return
-            self.log_msg(f"Launching interactive chat with {self.selected_model}...", style="system-msg")
-            # Defer execution to let UI paint first
-            self.set_timer(0.1, self._launch_interactive_chat)
-            
-        elif cmd == "/guide":
-            action = args[0] if args else "opencode"
-            self._run_cli_command(["guide", action])
-            
-        elif cmd == "/ssh":
-            action = args[0] if args else "status"
-            flags = args[1:] if args else []
-            self._run_cli_command(["ssh", action] + flags)
+        if command == "/config":
+            if not args:
+                return "[bold]/config[/]  [dim]→ choose a setting to inspect or update[/dim]"
+            key = args[0]
+            value = " ".join(args[1:]) if len(args) > 1 else "<value>"
+            return f"[bold]/config[/] [dim]›[/] [bold]{escape(key)}[/] [cyan]{escape(value)}[/cyan]\n[dim]Press Enter to apply this setting.[/dim]"
 
-        elif cmd == "/copy":
-            self.action_copy_last()
+        return ""
 
-        elif cmd == "/clear":
-            self._chat_history = []
-            self.log_msg("Conversation history cleared.", style="system-msg")
-
+    def _render_composer_hints(self, error: str | None = None) -> None:
+        mode = "command" if self._composer_text().lstrip().startswith("/") else "chat"
+        multiline_hint = "Ctrl+J / Option+Enter newline"
+        submit_hint = "Enter submit"
+        cancel_hint = "Ctrl+C cancel"
+        if error:
+            message = f"[red]{escape(error)}[/red]"
+        elif mode == "command":
+            message = self._command_hint_message()
         else:
-            self.log_msg(f"Unknown command: {cmd}", style="error-msg")
+            message = "[dim]Chat mode · Enter sends · type / for commands · Esc Esc edits previous prompt[/dim]"
+        self.query_one("#composer-hints", Static).update(
+            f"{message}\n[dim]{submit_hint} · {multiline_hint} · {cancel_hint} · PgUp/PgDn scroll transcript[/dim]"
+        )
 
+    def _command_hint_message(self) -> str:
+        text = self._composer_text().strip()
+        if not text.startswith("/"):
+            return "[dim]Slash mode · Enter executes when syntax is complete · Tab focuses suggestions[/dim]"
+        parts = text.split()
+        command = canonical_name(parts[0])
+        if command == "/models":
+            if len(parts) == 1:
+                return "[dim]Models · Choose an action like list, install, warm, remove, or verify[/dim]"
+            action = parts[1]
+            if action == "install":
+                return "[dim]Install · Type or paste a Hugging Face repo, or pick a recommended target from the drawer[/dim]"
+            if action in {"remove", "verify", "repair", "warm"}:
+                return f"[dim]{escape(action.title())} · Pick an installed model from the drawer or type its full repo id[/dim]"
+        if command == "/model":
+            return "[dim]Model · Pick one installed model to make it the active chat target[/dim]"
+        if command == "/runtime":
+            return "[dim]Runtime · Start uses the selected model by default; status and stop do not need extra input[/dim]"
+        if command == "/config":
+            return "[dim]Config · Pick a setting, then enter its new value[/dim]"
+        return "[dim]Slash mode · Enter executes when syntax is complete · Tab focuses suggestions[/dim]"
 
-    def _show_settings_summary(self) -> None:
-        """Display a formatted table of all current generation settings."""
+    def _statusline_value(self, field: str) -> str:
+        snapshot = self._runtime_snapshot or {}
+        if field == "state":
+            return f"state:{snapshot.get('status', 'offline')}"
+        if field == "model":
+            return f"model:{snapshot.get('loaded_model') or self.selected_model or 'none'}"
+        if field == "profile":
+            return f"profile:{snapshot.get('profile') or self._profile_name}"
+        if field == "session":
+            return f"session:{self._session_id}"
+        if field == "safe":
+            return f"safe:{'on' if self.runtime_safe else 'off'}"
+        if field == "memory":
+            memory = snapshot.get("memory_pressure", {}).get("state", "unknown")
+            return f"memory:{memory}"
+        if field == "queue":
+            return f"queue:{snapshot.get('queue_depth', 0)}"
+        if field == "warm":
+            loaded = snapshot.get("loaded_model")
+            status = "warm" if loaded and loaded == self.selected_model else "cold"
+            return f"path:{status}"
+        return field
+
+    def _render_statusline(self) -> None:
+        if not self._tui_settings.get("show_statusline", True):
+            self.query_one("#statusline", Static).update("")
+            return
+        fields = self._tui_settings.get("statusline_fields", list(STATUSLINE_FIELDS))
+        text = "  |  ".join(self._statusline_value(field) for field in fields if field in STATUSLINE_FIELDS)
+        self.query_one("#statusline", Static).update(text)
+
+    def _set_generation_inflight(self, active: bool) -> None:
+        self._generation_inflight = active
+        self.composer.disabled = active
+        self._render_composer_hints()
+        self._render_statusline()
+
+    def _queue_runtime_refresh(self) -> None:
+        if not self._snapshot_refresh_inflight:
+            self._refresh_runtime_snapshot()
+
+    @work(thread=True)
+    def _refresh_runtime_snapshot(self) -> None:
+        if not self._engine:
+            return
+        self._snapshot_refresh_inflight = True
+        try:
+            snapshot = self._engine.client.ps()
+        except Exception:
+            snapshot = {
+                "status": "offline",
+                "loaded_model": None,
+                "profile": self._profile_name,
+                "queue_depth": 0,
+                "memory_pressure": {"state": "unknown"},
+            }
+        self.call_from_thread(self._set_runtime_snapshot, snapshot)
+        self._snapshot_refresh_inflight = False
+
+    def _set_runtime_snapshot(self, snapshot: dict) -> None:
+        self._runtime_snapshot = snapshot
+        loaded = snapshot.get("loaded_model")
+        if loaded:
+            self.selected_model = loaded
+        self._render_statusline()
+        self._render_composer_header()
+        self._render_command_context()
+
+    @on(TextArea.Changed, "#composer")
+    def _on_composer_changed(self, _event: TextArea.Changed) -> None:
+        self._render_composer_header()
+        self._render_composer_hints()
+        self._refresh_drawer()
+
+    def _refresh_drawer(self) -> None:
+        text = self._composer_text().lstrip()
+        drawer = self.query_one("#drawer", Horizontal)
+        if not text.startswith("/"):
+            drawer.remove_class("-visible")
+            self.query_one("#drawer-list", OptionList).clear_options()
+            self.query_one("#drawer-details", Static).update("")
+            return
+        drawer.add_class("-visible")
+        self._populate_drawer(text)
+
+    def _drawer_visible(self) -> bool:
+        return self.query_one("#drawer", Horizontal).has_class("-visible")
+
+    def _move_drawer_selection(self, delta: int) -> bool:
+        if not self._drawer_visible():
+            return False
+        option_list = self.query_one("#drawer-list", OptionList)
+        if option_list.option_count == 0:
+            return False
+        current = option_list.highlighted if option_list.highlighted is not None else 0
+        new_index = max(0, min(option_list.option_count - 1, current + delta))
+        option_list.highlighted = new_index
+        entry = self._drawer_entries.get(f"drawer-{new_index}")
+        if entry:
+            self._show_drawer_detail(entry.get("detail", ""))
+        return True
+
+    def _apply_highlighted_drawer_option(self) -> bool:
+        if not self._drawer_visible():
+            return False
+        option_list = self.query_one("#drawer-list", OptionList)
+        index = option_list.highlighted
+        if index is None:
+            return False
+        entry = self._drawer_entries.get(f"drawer-{index}")
+        if not entry:
+            return False
+        value = entry["value"]
+        execute_now = not value.endswith(" ")
+        if execute_now:
+            self._set_composer_text(value)
+            self._submit_current_input()
+        else:
+            self._set_composer_text(value)
+        return True
+
+    def _populate_drawer(self, text: str) -> None:
+        option_list = self.query_one("#drawer-list", OptionList)
+        option_list.clear_options()
+        self._drawer_entries = {}
+
+        raw = text.strip()
+        body = raw[1:]
+        name_fragment, _, remainder = body.partition(" ")
+        slash_name = f"/{name_fragment}" if name_fragment else ""
+        normalized = canonical_name(slash_name) if slash_name else ""
+        suggestions: list[tuple[str, str, str]] = []
+
+        if not name_fragment:
+            for spec in iter_commands():
+                suggestions.append(self._spec_option(spec))
+            for custom in self._custom_commands.values():
+                suggestions.append(self._custom_option(custom))
+        elif slash_name in self._custom_commands:
+            custom = self._custom_commands[slash_name]
+            suggestions.append(self._custom_option(custom))
+        else:
+            spec = get_command(slash_name)
+            if spec is None and not raw.endswith(" "):
+                for item in iter_commands():
+                    if any(name.startswith(slash_name) for name in item.names) or name_fragment in item.description.lower():
+                        suggestions.append(self._spec_option(item))
+                for custom in self._custom_commands.values():
+                    if custom.slash_name.startswith(slash_name):
+                        suggestions.append(self._custom_option(custom))
+            else:
+                target = spec or get_command(normalized)
+                if target is not None:
+                    suggestions.extend(self._argument_suggestions(target, remainder))
+
+        if not suggestions:
+            suggestions.append((raw, raw, "Press Enter to execute the current command"))
+
+        for index, (label, value, detail) in enumerate(suggestions):
+            option_id = f"drawer-{index}"
+            self._drawer_entries[option_id] = {"value": value, "detail": detail}
+            option_list.add_option(Option(label, id=option_id))
+
+        if option_list.option_count:
+            option_list.highlighted = 0
+            self._show_drawer_detail(self._drawer_entries["drawer-0"]["detail"])
+
+    def _spec_option(self, spec: CommandSpec) -> tuple[str, str, str]:
+        aliases = f" aliases: {', '.join(spec.aliases)}" if spec.aliases else ""
+        label = f"[cyan]{spec.canonical}[/cyan] [dim]- {spec.description}[/dim]"
+        detail = f"[bold]{spec.canonical}[/]\n{escape(spec.description)}{aliases}\n[dim]{escape(spec.argument_hint or '(no arguments)')}[/dim]"
+        if self._tui_settings.get("show_examples_in_help", True) and spec.examples:
+            examples = "\n".join(f"  {escape(example)}" for example in spec.examples)
+            detail += f"\n[bold]Examples[/]\n{examples}"
+        return label, spec.canonical + (" " if spec.argument_hint else ""), detail
+
+    def _custom_option(self, custom: CustomCommand) -> tuple[str, str, str]:
+        hint = f" {custom.argument_hint}" if custom.argument_hint else ""
+        label = f"[magenta]{custom.slash_name}[/magenta] [dim]- {custom.description} ({custom.source})[/dim]"
+        detail = f"[bold]{custom.slash_name}[/] ({custom.source})\n{escape(custom.description)}\n[dim]{escape(hint or '(no arguments)')}[/dim]"
+        return label, custom.slash_name + (" " if custom.argument_hint else ""), detail
+
+    def _argument_suggestions(self, spec: CommandSpec, remainder: str) -> list[tuple[str, str, str]]:
+        remainder = remainder.lstrip()
+        if spec.canonical == "/model":
+            return self._model_repo_suggestions("/model", remainder)
+        if spec.canonical == "/models":
+            return self._models_suggestions(remainder)
+        if spec.canonical == "/runtime":
+            return self._simple_subcommand_suggestions(spec, remainder, ["start", "stop", "status", "options"])
+        if spec.canonical == "/daemon":
+            return self._simple_subcommand_suggestions(spec, remainder, ["start", "stop", "status", "install-launchd", "uninstall-launchd"])
+        if spec.canonical == "/profile":
+            return self._simple_subcommand_suggestions(spec, remainder, ["auto", "current", "list", "set", "calibrate"])
+        if spec.canonical == "/ssh":
+            return self._simple_subcommand_suggestions(spec, remainder, ["status", "stop", "tunnel", "snippet"])
+        if spec.canonical == "/statusline":
+            return self._simple_subcommand_suggestions(spec, remainder, ["show", "hide", "fields", "reset"])
+        if spec.canonical == "/help":
+            suggestions = [("commands", "/help commands", "Show all command categories"), ("keys", "/help keys", "Show keyboard shortcuts")]
+            for item in iter_commands():
+                suggestions.append((item.canonical, f"/help {item.canonical[1:]}", item.description))
+            return [(
+                f"[cyan]{label}[/cyan]",
+                value,
+                detail,
+            ) for label, value, detail in suggestions if not remainder or label.startswith(remainder)]
+        if spec.canonical == "/config":
+            settings = ["preset", "temp", "top_p", "top_k", "max_tokens", "max_context", "keep_alive", "safe", "system_prompt", "reset"]
+            return [(
+                f"[cyan]{setting}[/cyan] [dim]- configure {setting}[/dim]",
+                f"/config {setting} ",
+                f"Update {setting}",
+            ) for setting in settings if not remainder or setting.startswith(remainder)]
+        if spec.canonical == "/inspect":
+            values = [self._session_id]
+            if self.selected_model:
+                values.append(self.selected_model)
+            return [(
+                f"[cyan]{value}[/cyan]",
+                f"/inspect {value}",
+                f"Inspect {value}",
+            ) for value in values if value and (not remainder or remainder in value)]
+        if spec.canonical == "/benchmark":
+            if self.selected_model:
+                return [(
+                    f"[cyan]{self.selected_model}[/cyan]",
+                    f"/benchmark {self.selected_model}",
+                    "Benchmark the currently selected model",
+                )]
+        return [self._spec_option(spec)]
+
+    def _simple_subcommand_suggestions(self, spec: CommandSpec, remainder: str, subcommands: list[str]) -> list[tuple[str, str, str]]:
+        return [(
+            f"[cyan]{item}[/cyan] [dim]- {spec.description}[/dim]",
+            f"{spec.canonical} {item}",
+            f"{spec.canonical} {item}",
+        ) for item in subcommands if not remainder or item.startswith(remainder)]
+
+    def _models_suggestions(self, remainder: str) -> list[tuple[str, str, str]]:
+        parts = remainder.split(" ", 1)
+        action = parts[0] if parts[0] else ""
+        tail = parts[1].strip() if len(parts) > 1 else ""
+        actions = ["list", "install", "remove", "verify", "repair", "warm", "prune", "recommended", "scan"]
+        if action in {"install", "remove", "verify", "repair", "warm"}:
+            prefix = f"/models {action}"
+            return self._model_repo_suggestions(prefix, tail, install=(action == "install"))
+        return [(
+            f"[cyan]{item}[/cyan] [dim]- /models {item}[/dim]",
+            f"/models {item}" + (" " if item in {"install", "remove", "verify", "repair", "warm"} else ""),
+            self._models_action_detail(item),
+        ) for item in actions if not remainder or item.startswith(remainder)]
+
+    def _model_repo_suggestions(self, prefix: str, remainder: str, *, install: bool = False) -> list[tuple[str, str, str]]:
+        if install:
+            return self._install_repo_suggestions(prefix, remainder)
+        repos = _cached_list_models(disk=True, filter_relevant=not install)
+        suggestions = []
+        for item in repos:
+            repo = item["repo"]
+            if remainder and remainder.lower() not in repo.lower():
+                continue
+            suffix = item.get("disk_usage") or item.get("estimated_size", "unknown")
+            quant = item.get("quantization") or "unknown"
+            summary = item.get("summary") or "Installed model"
+            suggestions.append((
+                f"[cyan]{repo}[/cyan] [dim]{quant} · {suffix}[/dim]",
+                f"{prefix} {repo}",
+                f"[bold]{repo}[/]\n{escape(summary)}\n[dim]format={quant} · size={suffix}[/dim]"
+                + (f"\n[dim]{escape(item.get('when_to_use', ''))}[/dim]" if item.get("when_to_use") else ""),
+            ))
+        return suggestions or [(f"{prefix} {remainder}".strip(), f"{prefix} {remainder}".strip(), "Execute the current command")]
+
+    def _install_repo_suggestions(self, prefix: str, remainder: str) -> list[tuple[str, str, str]]:
+        suggestions: list[tuple[str, str, str]] = []
+        typed_repo = remainder.strip()
+        if typed_repo:
+            suggestions.append((
+                f"[cyan]{typed_repo}[/cyan] [dim]- install typed repo[/dim]",
+                f"{prefix} {typed_repo}",
+                f"[bold]Install typed repo[/]\nInstall [cyan]{escape(typed_repo)}[/cyan] from Hugging Face.\n[dim]Press Enter to run exactly what you typed.[/dim]",
+            ))
+        else:
+            suggestions.append((
+                "[cyan]Paste a Hugging Face repo[/cyan] [dim]- then press Enter[/dim]",
+                f"{prefix} ",
+                "[bold]Install a model[/]\nType a repo like [cyan]mlx-community/Qwen3.5-9B-OptiQ-4bit[/cyan], or pick one of the curated suggestions below.",
+            ))
+
+        for item in RECOMMENDED_MODELS:
+            repo = item["repo"]
+            if typed_repo and typed_repo.lower() not in repo.lower():
+                continue
+            metadata = MODEL_METADATA.get(repo, {})
+            quant = metadata.get("quantization") or "unknown"
+            size = item.get("estimated_size", "unknown")
+            summary = metadata.get("summary") or item.get("description") or "Recommended install target"
+            when_to_use = metadata.get("when_to_use", "")
+            suggestions.append((
+                f"[cyan]{repo}[/cyan] [dim]{quant} · {size}[/dim]",
+                f"{prefix} {repo}",
+                f"[bold]{repo}[/]\n{escape(summary)}\n[dim]format={quant} · size={size}[/dim]"
+                + (f"\n[dim]{escape(when_to_use)}[/dim]" if when_to_use else ""),
+            ))
+
+        return suggestions
+
+    @staticmethod
+    def _models_action_detail(action: str) -> str:
+        details = {
+            "list": "Show installed, relevant LLMs with quantization and usage guidance.",
+            "install": "Download a model into the Hugging Face cache. After selecting install, paste a Hugging Face repo or pick a curated suggestion.",
+            "remove": "Delete a cached model from disk.",
+            "verify": "Check required cache files and snapshot integrity.",
+            "repair": "Re-download a broken model cache entry.",
+            "warm": "Load a model into the daemon without changing chat history.",
+            "prune": "Remove invalid or incomplete cache directories.",
+            "recommended": "Show curated models for Apple Silicon profiles.",
+            "scan": "Scan the machine for large model-weight files.",
+        }
+        return details.get(action, f"/models {action}")
+
+    @on(OptionList.OptionHighlighted, "#drawer-list")
+    def _on_drawer_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        option_id = str(event.option.id)
+        detail = self._drawer_entries.get(option_id, {}).get("detail", "")
+        self._show_drawer_detail(detail)
+
+    @on(OptionList.OptionSelected, "#drawer-list")
+    def _on_drawer_selected(self, event: OptionList.OptionSelected) -> None:
+        option_id = str(event.option.id)
+        value = self._drawer_entries.get(option_id, {}).get("value", "")
+        execute_now = not value.endswith(" ")
+        if execute_now:
+            self._set_composer_text(value)
+            self._submit_current_input()
+        else:
+            self._set_composer_text(value)
+            self.composer.focus()
+
+    def _show_drawer_detail(self, detail: str) -> None:
+        self.query_one("#drawer-details", Static).update(detail)
+
+    def action_focus_composer_command(self) -> None:
+        self._focus_composer_command()
+
+    def _focus_composer_command(self) -> None:
+        if self.focused is self.composer:
+            self.composer.insert("/")
+            return
+        existing = self._composer_text()
+        self.composer.focus()
+        if existing == "/":
+            return
+        if existing.startswith("/"):
+            return
+        self.composer.insert("/")
+
+    def on_key(self, event: Key) -> None:
+        if event.character == "/" and self.focused is not self.composer:
+            self._focus_composer_command()
+            event.stop()
+            return
+        if self.focused is not self.composer:
+            return
+        if event.key == "escape":
+            self._handle_escape()
+            event.stop()
+
+    def _should_use_history(self, *, direction: str) -> bool:
+        if self._history is None:
+            return False
+        row, _col = self.composer.cursor_location
+        last_row = len(self._composer_text().splitlines() or [""]) - 1
+        if direction == "up":
+            return row == 0
+        return row == last_row
+
+    def _history_older(self) -> None:
+        if not self._history:
+            return
+        value = self._history.older(self._composer_text())
+        if value is not None:
+            self._set_composer_text(value)
+
+    def _history_newer(self) -> None:
+        if not self._history:
+            return
+        value = self._history.newer()
+        if value is not None:
+            self._set_composer_text(value)
+
+    def _handle_escape(self) -> None:
+        now = time.time()
+        if now - self._last_escape_at < 0.5:
+            self._last_escape_at = 0.0
+            self._load_previous_prompt()
+            return
+        self._last_escape_at = now
+        drawer = self.query_one("#drawer", Horizontal)
+        if drawer.has_class("-visible"):
+            drawer.remove_class("-visible")
+            self._render_composer_hints()
+
+    def _load_previous_prompt(self) -> None:
+        if not self._last_user_prompt:
+            self.log_msg("No previous chat prompt to edit.", style="system-msg")
+            return
+        self._set_composer_text(self._last_user_prompt)
+        self.log_msg("Loaded previous prompt into the composer.", style="system-msg")
+
+    def _insert_newline(self) -> None:
+        self.composer.insert("\n")
+
+    def _handle_enter_key(self) -> None:
+        text = self._composer_text()
+        if not text.strip():
+            return
+        if text.endswith("\\"):
+            self._set_composer_text(text[:-1] + "\n")
+            return
+        if text.lstrip().startswith("/"):
+            validation = self._validate_command(text)
+            if validation is not None:
+                if self._apply_highlighted_drawer_option():
+                    return
+                self._render_composer_hints(validation)
+                return
+        self._submit_current_input()
+
+    def composer_submit(self) -> None:
+        self._handle_enter_key()
+
+    def composer_newline(self) -> None:
+        self._insert_newline()
+
+    def composer_history_up(self) -> bool:
+        text = self._composer_text()
+        if text.lstrip().startswith("/") and self._drawer_visible():
+            return self._move_drawer_selection(-1)
+        if self._should_use_history(direction="up"):
+            self._history_older()
+            return True
+        return False
+
+    def composer_history_down(self) -> bool:
+        text = self._composer_text()
+        if text.lstrip().startswith("/") and self._drawer_visible():
+            return self._move_drawer_selection(1)
+        if self._should_use_history(direction="down"):
+            self._history_newer()
+            return True
+        return False
+
+    def composer_escape(self) -> None:
+        self._handle_escape()
+
+    def _submit_current_input(self) -> None:
+        raw = self._composer_text().strip()
+        if not raw:
+            return
+        if self._history:
+            self._history.push(raw)
+        self._clear_composer()
+        if raw.startswith("/"):
+            self._handle_command(raw)
+        else:
+            if self._generation_inflight:
+                self.log_msg("Generation already in progress. Cancel or wait for the current reply first.", style="system-msg")
+                return
+            self._last_user_prompt = raw
+            self._set_generation_inflight(True)
+            self.log_msg(f"You: {escape(raw)}", style="user-msg")
+            self._handle_chat(raw)
+
+    def _validate_command(self, command_line: str) -> str | None:
+        try:
+            parts = shlex.split(command_line)
+        except ValueError:
+            return "Incomplete command syntax. Close any open quote before executing."
+        if not parts:
+            return None
+        command = parts[0]
+        if command in self._custom_commands:
+            return None
+        spec = get_command(command)
+        if spec is None:
+            return f"Unknown command: {command}"
+        canonical = spec.canonical
+        args = parts[1:]
+        if canonical == "/model" and not args:
+            return "Model selection requires a repo name."
+        if canonical == "/models" and args:
+            action = args[0]
+            if action == "install" and len(args) < 2:
+                return "Install requires a Hugging Face repo. Paste one or choose a recommended target."
+        if canonical == "/chat" and not self.selected_model:
+            return "Select a model before launching CLI chat."
+        if canonical == "/inspect" and not args and not (self.selected_model or self._session_id):
+            return "Nothing to inspect yet."
+        if canonical == "/runtime" and (not args or args[0] == "start") and not self.selected_model and len(args) < 2:
+            return "Select a model or pass one explicitly before starting the runtime."
+        if canonical == "/config" and args:
+            key = args[0]
+            if key in {"temp", "top_p"} and len(args) > 1:
+                try:
+                    float(args[1])
+                except ValueError:
+                    return f"{key} must be numeric."
+            if key in {"top_k", "max_tokens", "max_context", "keep_alive"} and len(args) > 1:
+                if args[1].lower() not in {"auto", "none", "reset", "default"}:
+                    try:
+                        int(args[1])
+                    except ValueError:
+                        return f"{key} must be an integer or auto."
+            if key == "safe" and len(args) > 1 and args[1].lower() not in {"1", "0", "true", "false", "yes", "no", "on", "off", "safe", "unsafe"}:
+                return "safe accepts on/off, true/false, or safe/unsafe."
+        if canonical == "/statusline" and args:
+            action = args[0]
+            if action not in {"show", "hide", "fields", "reset"}:
+                return "statusline accepts show, hide, fields, or reset."
+            if action == "fields":
+                invalid = [field for field in args[1:] if field not in STATUSLINE_FIELDS]
+                if invalid:
+                    return f"Unknown statusline field(s): {', '.join(invalid)}"
+        return None
+
+    def _handle_command(self, command_line: str) -> None:
+        try:
+            parts = shlex.split(command_line)
+        except ValueError as exc:
+            self.log_msg(f"Command parse error: {exc}", style="error-msg")
+            return
+        if not parts:
+            return
+
+        command = parts[0]
+        if command in self._custom_commands:
+            self._run_custom_command(self._custom_commands[command], parts[1:], command_line)
+            return
+
+        spec = get_command(command)
+        if spec is None:
+            self.log_msg(f"Unknown command: {command}", style="error-msg")
+            return
+
+        command = spec.canonical
+        args = parts[1:]
+
+        if command == "/quit":
+            self.exit()
+        elif command == "/help":
+            self._show_help(args[0] if args else None)
+        elif command == "/doctor":
+            self._run_cli_command(["doctor"] + args)
+        elif command == "/model":
+            self._handle_model_select(args)
+        elif command == "/runtime":
+            self._handle_runtime_command(args)
+        elif command == "/daemon":
+            self._run_cli_command((["daemon"] + args) if args else ["daemon", "status"])
+        elif command == "/status":
+            self._show_status_panel()
+            self._run_cli_command(["ps"] + args)
+        elif command == "/inspect":
+            identifier = args[0] if args else (self.selected_model or self._session_id)
+            self._run_cli_command(["inspect", identifier] + args[1:])
+        elif command == "/logs":
+            if "--follow" in args:
+                self.set_timer(0.1, self._follow_logs)
+            else:
+                self._run_cli_command(["logs"] + args)
+        elif command == "/benchmark":
+            cli_args = ["benchmark"]
+            if not args or args[0].startswith("-"):
+                if not self.selected_model:
+                    self.log_msg("Select a model first or pass one explicitly.", style="error-msg")
+                    return
+                cli_args.append(self.selected_model)
+                cli_args.extend(args)
+            else:
+                cli_args.extend(args)
+            self._run_cli_command(cli_args)
+        elif command == "/models":
+            self._handle_models_command(args)
+        elif command == "/profile":
+            self._handle_profile_command(args)
+        elif command == "/config":
+            self._handle_config_command(args)
+        elif command == "/statusline":
+            self._handle_statusline_command(args)
+        elif command == "/chat":
+            if not self.selected_model:
+                self.log_msg("Select a model first.", style="error-msg")
+                return
+            self.log_msg(f"Launching CLI chat for {self.selected_model}…", style="system-msg")
+            self.set_timer(0.1, self._launch_interactive_chat)
+        elif command == "/guide":
+            self._run_cli_command(["guide"] + (args or ["opencode"]))
+        elif command == "/ssh":
+            self._run_cli_command(["ssh"] + (args or ["status"]))
+        elif command == "/copy":
+            self.action_copy_last()
+        elif command == "/clear":
+            self._chat_history = []
+            self._session_id = f"tui-{uuid.uuid4().hex[:8]}"
+            self.log_msg("Conversation history cleared. New session started.", style="system-msg")
+            self._render_composer_header()
+            self._render_statusline()
+
+    def _run_custom_command(self, custom: CustomCommand, args: list[str], raw: str) -> None:
+        prompt = custom.expand(args)
+        if not prompt:
+            self.log_msg(f"{custom.slash_name} expanded to an empty prompt.", style="error-msg")
+            return
+        if custom.model and custom.model != self.selected_model:
+            self.selected_model = custom.model
+            self._chat_history = []
+            self._session_id = f"tui-{uuid.uuid4().hex[:8]}"
+            self.log_msg(f"Custom command selected model: [bold]{custom.model}[/]", style="system-msg")
+        safe_override = self.runtime_safe if custom.safe is None else custom.safe
+        profile_override = custom.profile
+        self._last_user_prompt = prompt
+        self._set_generation_inflight(True)
+        self.log_msg(f"You: {escape(raw)}", style="user-msg")
+        self.log_msg(f"[dim]expanded → {escape(prompt)}[/dim]", style="system-msg")
+        self._handle_chat(prompt, profile_override=profile_override, safe_override=safe_override)
+
+    def _handle_model_select(self, args: list[str]) -> None:
+        if not args:
+            self.log_msg("Usage: /model <repo>", style="error-msg")
+            return
+        repo = args[0]
+        self.selected_model = repo
+        self._chat_history = []
+        self._session_id = f"tui-{uuid.uuid4().hex[:8]}"
+        self.log_msg(f"Selected model: [bold]{repo}[/]", style="system-msg")
+        self._ensure_server_for_model(repo)
+        self._render_composer_header()
+        self._render_statusline()
+
+    def _handle_runtime_command(self, args: list[str]) -> None:
+        action = args[0] if args else "start"
+        flags = args[1:] if args else []
+        if action == "start":
+            explicit_model = None
+            if flags and not flags[0].startswith("-"):
+                explicit_model = flags[0]
+                flags = flags[1:]
+            model = explicit_model or self.selected_model
+            if not model:
+                self.log_msg("Select a model before starting the runtime.", style="error-msg")
+                return
+            self.log_msg(f"Starting runtime for [bold]{model}[/]…", style="system-msg")
+            self._run_cli_command(["serve", "start", model] + flags)
+            self.selected_model = model
+        elif action in {"stop", "status", "options"}:
+            self._run_cli_command(["serve", action] + flags)
+        else:
+            self.log_msg(f"Unknown runtime action: {action}", style="error-msg")
+
+    def _handle_models_command(self, args: list[str]) -> None:
+        action = args[0] if args else "list"
+        tail = args[1:] if args else []
+        if action == "list":
+            _invalidate_model_cache()
+            self._run_cli_command(["models", "list"] + tail)
+        elif action == "scan":
+            self._run_cli_command(["models", "scan"])
+        elif action == "recommended":
+            self._run_cli_command(["models", "recommended"])
+        elif action == "prune":
+            self._run_cli_command(["models", "prune", "-y"] + tail)
+        elif action in {"install", "remove", "verify", "repair", "warm"}:
+            repo = tail[0] if tail else (self.selected_model if action != "install" else None)
+            if not repo:
+                self.log_msg(f"Usage: /models {action} <repo>", style="error-msg")
+                return
+            _invalidate_model_cache()
+            command = ["models", action, repo]
+            if action in {"install", "remove", "repair"}:
+                command.append("-y")
+            command.extend(tail[1:] if tail and repo == tail[0] else tail)
+            self._run_cli_command(command)
+        else:
+            self.log_msg(f"Unknown /models action: {action}", style="error-msg")
+
+    def _handle_profile_command(self, args: list[str]) -> None:
+        action = args[0] if args else "current"
+        tail = args[1:] if args else []
+        if action == "calibrate" and (not tail or tail[0].startswith("-")) and self.selected_model:
+            self._run_cli_command(["profile", "calibrate", self.selected_model] + tail)
+        else:
+            self._run_cli_command(["profile", action] + tail)
+        config = load_config()
+        self._profile_name, _profile = get_effective_profile(config)
+        self._render_composer_header()
+        self._render_statusline()
+
+    def _handle_config_command(self, args: list[str]) -> None:
+        if not args:
+            self._show_config_panel()
+            return
+        key = args[0].lower()
+        value = " ".join(args[1:]) if len(args) > 1 else ""
+        if key == "preset":
+            if value not in GENERATION_PRESETS:
+                self.log_msg(f"Unknown preset '{value}'.", style="error-msg")
+                return
+            preset = GENERATION_PRESETS[value]
+            self.gen_preset = value
+            self.gen_temp = preset["temp"]
+            self.gen_top_p = preset["top_p"]
+            self.gen_top_k = preset["top_k"]
+            self.gen_max_tokens = preset["max_tokens"]
+            self._persist_gen_settings()
+            self.log_msg(f"Applied preset [bold]{value}[/].", style="system-msg")
+            return
+        if key == "reset":
+            defaults = _default_generation_settings()
+            self.gen_preset = defaults["preset"]
+            self.gen_temp = defaults["temp"]
+            self.gen_top_p = defaults["top_p"]
+            self.gen_top_k = defaults["top_k"]
+            self.gen_max_tokens = defaults["max_tokens"]
+            self.gen_system_prompt = defaults["system_prompt"]
+            self.runtime_max_context = None
+            self.runtime_keep_alive = None
+            self.runtime_safe = True
+            self._persist_gen_settings()
+            self._persist_runtime_settings()
+            self._persist_session_defaults()
+            self.log_msg("Config reset to defaults.", style="system-msg")
+            self._show_config_panel()
+            return
+        if key == "system_prompt":
+            if not value:
+                self.log_msg(f"Current system prompt: {escape(self.gen_system_prompt)}", style="system-msg")
+                return
+            self.gen_system_prompt = value
+            self._persist_gen_settings()
+            self.log_msg("System prompt updated.", style="system-msg")
+            return
+        if not value:
+            self.log_msg(f"Usage: /config {key} <value>", style="error-msg")
+            return
+        try:
+            if key == "temp":
+                self.gen_temp = float(value)
+            elif key == "top_p":
+                self.gen_top_p = float(value)
+            elif key == "top_k":
+                self.gen_top_k = int(value)
+            elif key == "max_tokens":
+                self.gen_max_tokens = int(value)
+            elif key == "max_context":
+                self.runtime_max_context = None if value.lower() in {"auto", "none", "reset", "default"} else int(value)
+                self._persist_session_defaults()
+                self.log_msg(f"max_context → {self.runtime_max_context or 'auto'}", style="system-msg")
+                return
+            elif key == "keep_alive":
+                self.runtime_keep_alive = None if value.lower() in {"auto", "none", "reset", "default"} else int(value)
+                self._persist_session_defaults()
+                self.log_msg(f"keep_alive → {self.runtime_keep_alive or 'auto'}", style="system-msg")
+                return
+            elif key == "safe":
+                lowered = value.lower()
+                self.runtime_safe = lowered in {"1", "true", "yes", "on", "safe"}
+                self._persist_runtime_settings()
+                self.log_msg(f"safe → {'on' if self.runtime_safe else 'off'}", style="system-msg")
+                self._render_statusline()
+                return
+            else:
+                self.log_msg(f"Unknown config key: {key}", style="error-msg")
+                return
+            self.gen_preset = "custom"
+            self._persist_gen_settings()
+            self.log_msg(f"{key} → {value} (preset → custom)", style="system-msg")
+        except ValueError:
+            self.log_msg(f"Invalid value for {key}: {value}", style="error-msg")
+        self._render_statusline()
+
+    def _show_config_panel(self) -> None:
         lines = [
-            f"  [bold]preset[/]         {self.gen_preset}",
-            f"  [bold]temp[/]           {self.gen_temp}",
-            f"  [bold]top_p[/]          {self.gen_top_p}",
-            f"  [bold]max_tokens[/]     {self.gen_max_tokens}",
-            f"  [bold]system_prompt[/]  {self.gen_system_prompt}",
+            "[bold]Current Config[/]",
+            f"preset={self.gen_preset}  temp={self.gen_temp}  top_p={self.gen_top_p}  top_k={self.gen_top_k}",
+            f"max_tokens={self.gen_max_tokens}  max_context={self.runtime_max_context or 'auto'}  keep_alive={self.runtime_keep_alive or 'auto'}  safe={'on' if self.runtime_safe else 'off'}",
+            f"system_prompt={escape(self.gen_system_prompt)}",
             "",
-            "  [dim]Presets:[/dim]",
+            "[dim]Examples[/dim]",
+            "  /config preset balanced",
+            "  /config max_context 8192",
+            "  /config safe off",
+            "  /config system_prompt You are a concise coding assistant.",
         ]
-        for name, info in GENERATION_PRESETS.items():
-            marker = " [bold green]✓[/]" if name == self.gen_preset else ""
-            lines.append(
-                f"    [cyan]{name:10}[/cyan] temp={info['temp']}  top_p={info['top_p']}  "
-                f"max_tokens={info['max_tokens']}  [dim]{info['description']}[/dim]{marker}"
-            )
-        lines.append("")
-        lines.append("  [dim]Usage: /set preset <name> | /set <param> <value> | /set reset[/dim]")
         self.log_msg("\n".join(lines), style="system-msg")
 
+    def _handle_statusline_command(self, args: list[str]) -> None:
+        action = args[0] if args else "fields"
+        if action == "show":
+            self._tui_settings["show_statusline"] = True
+        elif action == "hide":
+            self._tui_settings["show_statusline"] = False
+        elif action == "reset":
+            self._tui_settings["show_statusline"] = True
+            self._tui_settings["statusline_fields"] = list(STATUSLINE_FIELDS)
+        elif action == "fields":
+            if args[1:]:
+                self._tui_settings["statusline_fields"] = [field for field in args[1:] if field in STATUSLINE_FIELDS]
+        else:
+            self.log_msg("Usage: /statusline show|hide|fields|reset [field ...]", style="error-msg")
+            return
+        save_tui_settings(self._tui_settings)
+        self._render_statusline()
+        self.log_msg(
+            f"Status line → {'shown' if self._tui_settings.get('show_statusline', True) else 'hidden'}; fields={', '.join(self._tui_settings.get('statusline_fields', []))}",
+            style="system-msg",
+        )
+
+    def _show_status_panel(self) -> None:
+        snapshot = self._runtime_snapshot or {}
+        lines = [
+            "[bold]Runtime Snapshot[/]",
+            f"state={snapshot.get('status', 'offline')}",
+            f"model={snapshot.get('loaded_model') or 'none'}",
+            f"profile={snapshot.get('profile') or self._profile_name}",
+            f"sessions={snapshot.get('session_count', 0)}",
+            f"queue={snapshot.get('queue_depth', 0)}",
+            f"memory={snapshot.get('memory_pressure', {}).get('state', 'unknown')}",
+            f"keep_alive={snapshot.get('keep_alive_seconds', self.runtime_keep_alive)}",
+        ]
+        self.log_msg("\n".join(lines), style="system-msg")
+
+    def _show_help(self, subject: str | None = None) -> None:
+        if subject in {None, "", "commands"}:
+            lines = ["[bold]Commands[/]"]
+            categories: dict[str, list[CommandSpec]] = {}
+            for spec in iter_commands():
+                categories.setdefault(spec.category, []).append(spec)
+            for category, items in categories.items():
+                lines.append(f"\n[bold]{category}[/]")
+                for spec in items:
+                    alias_text = f" [dim](aliases: {', '.join(spec.aliases)})[/dim]" if spec.aliases else ""
+                    lines.append(f"  [cyan]{spec.canonical}[/cyan] {spec.description}{alias_text}")
+                    lines.append(f"  [dim]{spec.argument_hint or '(no arguments)'}[/dim]")
+            if self._custom_commands:
+                lines.append("\n[bold]Custom Commands[/]")
+                for custom in self._custom_commands.values():
+                    lines.append(f"  [magenta]{custom.slash_name}[/magenta] {custom.description} [dim]({custom.source})[/dim]")
+            self.log_msg("\n".join(lines), style="system-msg")
+            return
+        if subject == "keys":
+            self.log_msg(
+                "\n".join(
+                    [
+                        "[bold]Keyboard Shortcuts[/]",
+                        "  Enter              submit current command or chat prompt",
+                        "  Ctrl+J / Option+Enter  insert newline",
+                        "  Up / Down          history navigation at top/bottom of composer",
+                        "  Esc Esc            load previous chat prompt",
+                        "  Ctrl+C             cancel active generation",
+                        "  Ctrl+D             quit",
+                        "  Ctrl+L             clear transcript",
+                        "  Ctrl+Y             copy last assistant response",
+                        "  Ctrl+R             refresh runtime snapshot",
+                    ]
+                ),
+                style="system-msg",
+            )
+            return
+        spec = get_command(subject)
+        if spec is None:
+            normalized = subject if subject.startswith("/") else f"/{subject}"
+            custom = self._custom_commands.get(normalized)
+            if custom:
+                detail = self._custom_option(custom)[2]
+                self.log_msg(detail, style="system-msg")
+            else:
+                self.log_msg(f"Unknown help topic: {subject}", style="error-msg")
+            return
+        detail = self._spec_option(spec)[2]
+        self.log_msg(detail, style="system-msg")
+
     def _persist_gen_settings(self) -> None:
-        """Save current generation settings to config."""
-        save_generation_settings({
-            "preset": self.gen_preset,
-            "temp": self.gen_temp,
-            "top_p": self.gen_top_p,
-            "max_tokens": self.gen_max_tokens,
-            "system_prompt": self.gen_system_prompt,
-        })
+        save_generation_settings(
+            {
+                "preset": self.gen_preset,
+                "temp": self.gen_temp,
+                "top_p": self.gen_top_p,
+                "top_k": self.gen_top_k,
+                "max_tokens": self.gen_max_tokens,
+                "system_prompt": self.gen_system_prompt,
+            }
+        )
+
+    def _persist_runtime_settings(self) -> None:
+        save_runtime_settings({"safe_mode": self.runtime_safe})
+
+    def _persist_session_defaults(self) -> None:
+        config = load_config()
+        config["session_defaults"] = {
+            **config.get("session_defaults", {}),
+            "max_context": self.runtime_max_context,
+            "keep_alive_seconds": self.runtime_keep_alive,
+        }
+        save_config(config)
 
     @work(thread=True)
     def _run_cli_command(self, args: list[str]) -> None:
         import sys
-        from rich.markup import escape
-        
-        self.app.call_from_thread(self.start_thinking)
+
+        self.call_from_thread(self.start_thinking)
         try:
             result = subprocess.run(
                 [sys.executable, "-m", "local_llm.cli"] + args,
                 capture_output=True,
                 text=True,
             )
-            
             if result.stdout:
-                # Basic cleanup of rich CLI formatting markers that break RichLog occasionally
-                out = result.stdout
-                self.app.call_from_thread(self._append_to_log, escape(out))
+                self.call_from_thread(self.log_msg, escape(result.stdout), "system-msg")
             if result.stderr:
-                self.app.call_from_thread(self._append_to_log, escape(result.stderr), "error-msg")
-                
-        except Exception as e:
-            self.app.call_from_thread(self._append_to_log, str(e), "error-msg")
+                self.call_from_thread(self.log_msg, escape(result.stderr), "error-msg")
+        except Exception as exc:
+            self.call_from_thread(self.log_msg, str(exc), "error-msg")
         finally:
-            self.app.call_from_thread(self.stop_thinking)
+            self.call_from_thread(self.stop_thinking)
+            self.call_from_thread(self._queue_runtime_refresh)
 
-    def _append_to_log(self, text: str, style: str = "") -> None:
-        self.log_msg(text, style)
+    def _follow_logs(self) -> None:
+        import sys
+
+        with self.suspend():
+            subprocess.run([sys.executable, "-m", "local_llm.cli", "logs", "--follow"])
+        self.log_msg("Stopped following logs.", style="system-msg")
 
     def _launch_interactive_chat(self) -> None:
-        python = get_mlx_python()
-        with self.suspend():
-            subprocess.run([python, "-m", "mlx_lm", "chat", "--model", self.selected_model])
-        self.log_msg("Chat session ended.", style="system-msg")
+        import sys
 
-    def _create_stream_widget(self, widget_id: str, style: str = "") -> None:
-        log = self.query_one("#log-area", VerticalScroll)
-        # Disable markup so Model tokens like [ or ] don't crash Textual rendering
-        widget = Static("", id=widget_id, classes=style, markup=False)
+        cli_args = [
+            sys.executable,
+            "-m",
+            "local_llm.cli",
+            "chat",
+            self.selected_model,
+            "--session",
+            self._session_id,
+            "--temp",
+            str(self.gen_temp),
+            "--top-p",
+            str(self.gen_top_p),
+            "--top-k",
+            str(self.gen_top_k),
+            "--max-tokens",
+            str(self.gen_max_tokens),
+        ]
+        if self.runtime_max_context is not None:
+            cli_args.extend(["--max-context", str(self.runtime_max_context)])
+        if self.runtime_keep_alive is not None:
+            cli_args.extend(["--keep-alive", str(self.runtime_keep_alive)])
+        cli_args.append("--safe" if self.runtime_safe else "--unsafe")
+        with self.suspend():
+            subprocess.run(cli_args)
+        self.log_msg("CLI chat session ended.", style="system-msg")
+        self._queue_runtime_refresh()
+
+    def _create_stream_widget(self, widget_id: str) -> None:
+        log = self.query_one("#transcript", VerticalScroll)
+        widget = Static("", id=widget_id, markup=False)
         log.mount(widget)
         log.scroll_end(animate=False)
 
-    def _update_stream_widget(self, widget_id: str, full_text: str, is_final: bool = False) -> None:
+    def _update_stream_widget(self, widget_id: str, text: str, final: bool = False) -> None:
         try:
             widget = self.query_one(f"#{widget_id}", Static)
-            if is_final:
-                widget.update(Markdown(full_text))
-            else:
-                widget.update(full_text)
-            self.query_one("#log-area", VerticalScroll).scroll_end(animate=False)
+            widget.update(_render_assistant_text(text, final=final))
+            self.query_one("#transcript", VerticalScroll).scroll_end(animate=False)
         except Exception:
             pass
 
-    def _restyle_stream_widget(self, widget_id: str, style: str) -> None:
-        try:
-            widget = self.query_one(f"#{widget_id}", Static)
-            widget.set_classes(style)
-        except Exception:
-            pass
+    def _append_summary(self, summary: dict) -> None:
+        metrics = summary.get("local_llm", {}).get("metrics", {})
+        usage = summary.get("usage", {})
+        if not metrics and not usage:
+            return
+        line = (
+            f"[dim]summary "
+            f"ttft={metrics.get('ttft_seconds', 0):.2f}s "
+            f"tok/s={metrics.get('generation_tps', 0):.2f} "
+            f"cache={'hit' if metrics.get('cache_hit') else 'miss'} "
+            f"prompt={usage.get('prompt_tokens', 0)} "
+            f"output={usage.get('completion_tokens', 0)} "
+            f"finish={metrics.get('finish_reason', 'unknown')}[/dim]"
+        )
+        self.log_msg(line, style="summary-msg")
 
     @work(thread=True)
     def _ensure_server_for_model(self, model: str) -> None:
-        """Start or swap the MLX server for the given model (background worker)."""
         if not self._engine:
             return
-        self.app.call_from_thread(self.start_thinking)
+        self.call_from_thread(self.start_thinking)
         try:
-            def on_status(msg: str) -> None:
-                self.app.call_from_thread(self._append_to_log, msg, "system-msg")
-
-            self._engine.ensure_server(model, on_status=on_status)
-        except Exception as e:
-            self.app.call_from_thread(self._append_to_log, f"Server error: {e}", "error-msg")
+            self._engine.ensure_server(
+                model,
+                keep_alive_seconds=self.runtime_keep_alive,
+                safe_mode=self.runtime_safe,
+                on_status=lambda message: self.call_from_thread(self.log_msg, message, "system-msg"),
+            )
+        except Exception as exc:
+            self.call_from_thread(self.log_msg, f"Runtime error: {exc}", "error-msg")
         finally:
-            self.app.call_from_thread(self.stop_thinking)
+            self.call_from_thread(self.stop_thinking)
+            self.call_from_thread(self._queue_runtime_refresh)
 
     @work(thread=True)
-    def _handle_chat(self, prompt: str) -> None:
-        import uuid
-        if not self.selected_model:
-            self.app.call_from_thread(self._append_to_log, "Error: Select a model first.", "error-msg")
-            return
-
+    def _cancel_active_request(self) -> None:
         if not self._engine:
-            self.app.call_from_thread(self._append_to_log, "Engine not initialized.", "error-msg")
+            return
+        try:
+            result = self._engine.client.cancel()
+            message = "Generation cancelled." if result.get("cancelled") else "No active request was cancelled."
+            self.call_from_thread(self.log_msg, message, "system-msg")
+        except Exception as exc:
+            self.call_from_thread(self.log_msg, f"Cancel failed: {exc}", "error-msg")
+
+    @work(thread=True)
+    def _handle_chat(
+        self,
+        prompt: str,
+        *,
+        profile_override: str | None = None,
+        safe_override: bool | None = None,
+    ) -> None:
+        if not self._engine:
+            self.call_from_thread(self.log_msg, "Engine not initialized.", "error-msg")
+            self.call_from_thread(self._set_generation_inflight, False)
+            return
+        if not self.selected_model:
+            self.call_from_thread(self.log_msg, "Select a model first.", "error-msg")
+            self.call_from_thread(self._set_generation_inflight, False)
             return
 
-        self.app.call_from_thread(self.start_thinking)
+        safe_value = self.runtime_safe if safe_override is None else safe_override
+        self.call_from_thread(self.start_thinking)
+
+        widget_id = f"stream-{uuid.uuid4().hex}"
+        self.call_from_thread(self._create_stream_widget, widget_id)
 
         try:
-            widget_id = f"stream-{uuid.uuid4().hex}"
-            self.app.call_from_thread(self._create_stream_widget, widget_id, "system-msg")
-
-            # Ensure server is running for the selected model
-            if self._engine.get_running_model() != self.selected_model:
-                self.app.call_from_thread(
-                    self._update_stream_widget, widget_id,
-                    f"Starting server for {self.selected_model}… (first message takes longer)"
-                )
+            running_model = self._engine.get_running_model()
+            if running_model != self.selected_model:
+                self.call_from_thread(self._update_stream_widget, widget_id, f"Warming {self.selected_model}…")
                 self._engine.ensure_server(
                     self.selected_model,
-                    on_status=lambda msg: self.app.call_from_thread(
-                        self._update_stream_widget, widget_id, msg
-                    ),
+                    profile=profile_override,
+                    keep_alive_seconds=self.runtime_keep_alive,
+                    safe_mode=safe_value,
+                    on_status=lambda message: self.call_from_thread(self._update_stream_widget, widget_id, message),
                 )
 
-            self.app.call_from_thread(
-                self._update_stream_widget, widget_id, "Generating…"
-            )
-
-            # Build messages: system prompt + history + new user message
+            self.call_from_thread(self._update_stream_widget, widget_id, "Generating…")
             self._chat_history.append({"role": "user", "content": prompt})
-            messages = [
-                {"role": "system", "content": self.gen_system_prompt},
-                *self._chat_history,
-            ]
+            messages = [{"role": "system", "content": self.gen_system_prompt}, *self._chat_history]
 
-            # Stream tokens via HTTP
             full_text = ""
-            token_count = 0
             for chunk in self._engine.chat_stream(
                 messages,
                 temperature=self.gen_temp,
                 top_p=self.gen_top_p,
+                top_k=self.gen_top_k,
                 max_tokens=self.gen_max_tokens,
+                session=self._session_id,
+                max_context=self.runtime_max_context,
+                keep_alive_seconds=self.runtime_keep_alive,
+                profile=profile_override,
+                safe=safe_value,
             ):
                 full_text += chunk
-                token_count += 1
+                if len(full_text) % 24 == 0 or chunk.endswith(("\n", ".", "!", "?")):
+                    self.call_from_thread(self._update_stream_widget, widget_id, full_text)
 
-                # Update widget periodically to avoid overwhelming UI
-                if token_count % 3 == 0 or chunk in ("\n", ". ", "? ", "! "):
-                    display_text = re.sub(
-                        r'<think>.*?(</think>|$)', '', full_text, flags=re.DOTALL
-                    ).strip()
-                    self.app.call_from_thread(
-                        self._update_stream_widget, widget_id, display_text
-                    )
-
-            # Final render as markdown
-            display_text = re.sub(
-                r'<think>.*?(</think>|$)', '', full_text, flags=re.DOTALL
-            ).strip()
-            self._last_response = display_text
-            self._chat_history.append({"role": "assistant", "content": full_text})
-            self.app.call_from_thread(
-                self._update_stream_widget, widget_id, display_text, True
-            )
-
-        except Exception as e:
-            self.app.call_from_thread(
-                self._append_to_log, f"Chat error: {e}", "error-msg"
-            )
+            cleaned = re.sub(r"<think>.*?(</think>|$)", "", full_text, flags=re.DOTALL).strip()
+            self._last_response = cleaned
+            self._chat_history.append({"role": "assistant", "content": cleaned})
+            self.call_from_thread(self._update_stream_widget, widget_id, full_text, True)
+            self.call_from_thread(self._append_summary, self._engine.last_summary)
+        except Exception as exc:
+            self.call_from_thread(self.log_msg, f"Chat error: {exc}", "error-msg")
         finally:
-            self.app.call_from_thread(self.stop_thinking)
+            self.call_from_thread(self._set_generation_inflight, False)
+            self.call_from_thread(self.stop_thinking)
+            self.call_from_thread(self._queue_runtime_refresh)
 
-    def on_unmount(self) -> None:
-        """Clean up: stop the MLX server when the TUI exits."""
-        if self._engine:
-            try:
-                self._engine.stop_server()
-            except Exception:
-                pass
 
 if __name__ == "__main__":
-    app = CommandPalette()
-    app.run(mouse=False)
+    CommandPalette().run(mouse=False)

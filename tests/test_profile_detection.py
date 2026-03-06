@@ -28,8 +28,7 @@ def test_m1_pro_64gb():
 def test_m4_32gb():
     """M4 with more memory still matches M4 profile first."""
     result = match_profile("Apple M4", 32)
-    # Should match m4mini16 since chip pattern matches
-    assert result in ("m4mini16", "m1pro32")
+    assert result == "m432"
 
 
 def test_unknown_chip_high_memory():
