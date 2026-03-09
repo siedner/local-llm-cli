@@ -138,24 +138,31 @@ def daemon_stop(port: int = DEFAULT_PORT) -> None:
         DAEMON_PID_FILE.unlink(missing_ok=True)
 
 
-def daemon_status(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
-    """Show daemon status."""
+def _daemon_snapshot(host: str, port: int) -> dict | None:
     client = DaemonClient(host, port)
     try:
-        snapshot = client.health()
+        return client.health()
     except Exception:
+        return None
+
+
+def daemon_status(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+    """Show daemon status."""
+    snapshot = _daemon_snapshot(host, port)
+    if snapshot is None:
         ui.info(f"No daemon detected on {host}:{port}.")
         return
 
-    ui.header("Daemon Status")
-    ui.kv("State", snapshot["status"])
-    ui.kv("Profile", snapshot["profile"])
+    ui.header("Daemon Process")
+    ui.kv("Status", "running")
     ui.kv("Base URL", f"http://{host}:{port}/v1")
+    ui.kv("Runtime state", snapshot["status"])
     ui.kv("Loaded model", snapshot.get("loaded_model") or "none")
-    ui.kv("Memory pressure", snapshot["memory_pressure"]["state"])
-    ui.kv("Keep alive", str(snapshot["keep_alive_seconds"]))
+    ui.kv("Profile", snapshot["profile"])
+    ui.kv("Request timeout", f"{snapshot['request_timeout_seconds']}s")
     if snapshot.get("active_request_id"):
         ui.kv("Active request", snapshot["active_request_id"])
+    ui.info("Use `local-llm serve status` for the loaded-model view, or `local-llm daemon stop` to stop the process.")
 
 
 def serve(
@@ -203,13 +210,46 @@ def serve(
 
 
 def serve_stop(port: int = DEFAULT_PORT) -> None:
-    """Stop the daemon."""
-    daemon_stop(port=port)
+    """Offload the warmed model while keeping the daemon running."""
+    client = DaemonClient(DEFAULT_HOST, port)
+    try:
+        snapshot = client.health()
+    except Exception:
+        ui.info(f"No daemon detected on {DEFAULT_HOST}:{port}.")
+        return
+
+    loaded_model = snapshot.get("loaded_model")
+    if not loaded_model:
+        ui.info(f"No warm model loaded on {DEFAULT_HOST}:{port}.")
+        return
+
+    try:
+        result = client.evict(loaded_model)
+    except DaemonError as exc:
+        ui.error(str(exc))
+        return
+
+    evicted_model = result.get("evicted_model") or loaded_model
+    ui.success(f"Offloaded model {evicted_model}.")
+    ui.info("Daemon is still running. Use `local-llm daemon stop` to stop the process.")
 
 
 def serve_status(port: int = DEFAULT_PORT) -> None:
     """Show runtime status."""
-    daemon_status(port=port)
+    snapshot = _daemon_snapshot(DEFAULT_HOST, port)
+    if snapshot is None:
+        ui.info(f"No daemon detected on {DEFAULT_HOST}:{port}.")
+        return
+
+    ui.header("Runtime (Loaded Model State)")
+    ui.kv("State", snapshot["status"])
+    ui.kv("Model", snapshot.get("loaded_model") or "none")
+    ui.kv("Profile", snapshot["profile"])
+    ui.kv("Sessions", str(snapshot.get("session_count", 0)))
+    ui.kv("Memory pressure", snapshot["memory_pressure"]["state"])
+    ui.kv("Keep alive", str(snapshot["keep_alive_seconds"]))
+    ui.kv("Request timeout", f"{snapshot['request_timeout_seconds']}s")
+    ui.info("The daemon process is running. Use `local-llm daemon status` for process-level status.")
 
 
 def show_ps(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
@@ -351,6 +391,8 @@ def serve_options() -> None:
     """Print runtime defaults and controls."""
     ui.header("Daemon Runtime Defaults")
     ui.panel(
+        "  daemon = background process\n"
+        "  runtime = loaded model state inside that daemon\n"
         "  one warm model per machine\n"
         "  one active request at a time\n"
         "  profile-aware context caps\n"

@@ -18,6 +18,19 @@ def test_command_aliases_resolve_to_canonical():
     assert get_command("/serve").canonical == "/runtime"
 
 
+def test_runtime_and_daemon_command_descriptions_explain_the_split():
+    runtime = get_command("/runtime")
+    daemon = get_command("/daemon")
+    status = get_command("/status")
+
+    assert runtime is not None
+    assert daemon is not None
+    assert status is not None
+    assert "loaded model inside the daemon process" in runtime.description
+    assert "daemon process" in daemon.description
+    assert "loaded-model snapshot" in status.description
+
+
 def test_discover_custom_commands(tmp_path):
     project_commands = tmp_path / ".local-llm" / "commands"
     user_commands = tmp_path / "user-commands"

@@ -7,7 +7,7 @@ import sys
 import uuid
 
 from . import ui
-from .config import get_generation_settings
+from .config import get_generation_settings, get_runtime_settings
 from .engine import Engine
 
 
@@ -31,6 +31,7 @@ def chat(
     """
     # Load persisted settings as defaults
     gs = get_generation_settings()
+    runtime = get_runtime_settings()
     if temp is None:
         temp = gs["temp"]
     if top_p is None:
@@ -44,7 +45,11 @@ def chat(
     engine = Engine()
     session_id = session or f"cli-{uuid.uuid4().hex[:8]}"
     ui.info(f"Chat with {model}")
-    ui.info(f"Settings: temp={temp}  top_p={top_p}  top_k={top_k}  max_tokens={max_tokens}")
+    ui.info(
+        "Settings: "
+        f"temp={temp}  top_p={top_p}  top_k={top_k}  "
+        f"max_tokens={max_tokens}  request_timeout={runtime['request_timeout_seconds']}s"
+    )
     ui.info("Type your messages.  Ctrl+C or Ctrl+D to exit.\n")
 
     # Start server eagerly so user doesn't wait on the first message
@@ -101,6 +106,17 @@ def chat(
                 sys.stdout.flush()
 
             sys.stdout.write("\n\n")
+            summary = engine.last_summary.get("local_llm", {}).get("metrics", {})
+            usage = engine.last_summary.get("usage", {})
+            if summary or usage:
+                ui.info(
+                    "Summary: "
+                    f"finish={summary.get('finish_reason', 'unknown')}  "
+                    f"output={usage.get('completion_tokens', 0)}  "
+                    f"ttft={summary.get('ttft_seconds', 0):.2f}s  "
+                    f"tok/s={summary.get('generation_tps', 0):.2f}"
+                )
+                ui.console.print()
 
             # Strip thinking tags for history storage
             clean = re.sub(r'<think>.*?(</think>|$)', '', full_text, flags=re.DOTALL).strip()

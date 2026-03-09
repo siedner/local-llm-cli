@@ -15,8 +15,22 @@ except ImportError:
     sys.exit(1)
 
 from . import __version__, ui
-from .config import detect_profile, get_effective_profile, get_profile_name, load_config, save_config
-from .constants import DEFAULT_HOST, DEFAULT_PORT, PROFILES, RECOMMENDED_MODELS
+from .config import (
+    detect_output_size_profile,
+    detect_profile,
+    get_effective_profile,
+    get_generation_settings,
+    get_output_size_profile,
+    get_profile_name,
+    get_runtime_settings,
+    get_session_defaults,
+    load_config,
+    normalize_output_size_profile,
+    save_config,
+    save_generation_settings,
+    save_runtime_settings,
+)
+from .constants import DEFAULT_HOST, DEFAULT_PORT, OUTPUT_SIZE_PROFILES, PROFILES, RECOMMENDED_MODELS
 from .server import (
     benchmark_runtime,
     calibrate_profile,
@@ -79,6 +93,72 @@ def doctor(
 
 profile_app = typer.Typer(help="Manage hardware profiles.", no_args_is_help=True)
 app.add_typer(profile_app, name="profile")
+
+config_app = typer.Typer(help="Manage persisted generation and runtime defaults.", no_args_is_help=True)
+app.add_typer(config_app, name="config")
+
+
+def _show_config_summary() -> None:
+    config = load_config()
+    generation = get_generation_settings(config)
+    runtime = get_runtime_settings(config)
+    session_defaults = get_session_defaults(config)
+    size = detect_output_size_profile(generation["max_tokens"], runtime["request_timeout_seconds"]) or "custom"
+
+    ui.header("Config")
+    ui.kv("Preset", generation["preset"])
+    ui.kv("Size", size)
+    ui.kv("Max tokens", str(generation["max_tokens"]))
+    ui.kv("Request timeout", f"{runtime['request_timeout_seconds']}s")
+    ui.kv("Max context", str(session_defaults.get("max_context") or "auto"))
+    ui.kv("Keep alive", str(session_defaults.get("keep_alive_seconds") or "auto"))
+    ui.kv("Safe mode", "on" if runtime.get("safe_mode", True) else "off")
+
+
+@config_app.command("show")
+def config_show():
+    """Show persisted generation and runtime defaults."""
+    _show_config_summary()
+
+
+@config_app.command("size")
+def config_size(name: str = Argument(help="Output size profile: S, M, L, XL, XXL")):
+    """Apply an output size profile for max tokens and request timeout."""
+    profile_name = normalize_output_size_profile(name)
+    if profile_name is None:
+        ui.error(f"Unknown size profile '{name}'. Available: {', '.join(OUTPUT_SIZE_PROFILES)}")
+        raise typer.Exit(1)
+
+    profile = get_output_size_profile(profile_name)
+    assert profile is not None
+    save_generation_settings({"max_tokens": profile["max_tokens"]})
+    save_runtime_settings({"request_timeout_seconds": profile["request_timeout_seconds"]})
+    ui.success(
+        f"Applied size {profile_name}: max_tokens={profile['max_tokens']} request_timeout={profile['request_timeout_seconds']}s"
+    )
+    _show_config_summary()
+
+
+@config_app.command("max-tokens")
+def config_max_tokens(value: int = Argument(help="Default max output tokens per response")):
+    """Set the default max output tokens per response."""
+    if value <= 0:
+        ui.error("max-tokens must be greater than 0.")
+        raise typer.Exit(1)
+    save_generation_settings({"max_tokens": value})
+    ui.success(f"Default max tokens set to {value}.")
+    _show_config_summary()
+
+
+@config_app.command("request-timeout")
+def config_request_timeout(seconds: int = Argument(help="Request timeout in seconds")):
+    """Set the daemon request timeout for each generation."""
+    if seconds <= 0:
+        ui.error("request-timeout must be greater than 0.")
+        raise typer.Exit(1)
+    save_runtime_settings({"request_timeout_seconds": seconds})
+    ui.success(f"Request timeout set to {seconds}s.")
+    _show_config_summary()
 
 
 @profile_app.command("list")
@@ -299,7 +379,7 @@ def chat(
     )
 
 
-serve_app = typer.Typer(help="Manage the daemon-backed runtime.", no_args_is_help=True)
+serve_app = typer.Typer(help="Manage the loaded model inside the background daemon.", no_args_is_help=True)
 app.add_typer(serve_app, name="serve")
 
 
@@ -314,7 +394,7 @@ def serve_start(
     log: Optional[str] = Option(None, "--log", help="Daemon log file"),
     safe: bool = Option(True, "--safe/--unsafe", help="Use conservative profile limits"),
 ):
-    """Start the daemon and warm a model."""
+    """Start the daemon if needed and warm a model into it."""
     serve(
         model,
         host=host,
@@ -329,13 +409,13 @@ def serve_start(
 
 @serve_app.command("stop")
 def serve_stop_cmd(port: int = Option(DEFAULT_PORT, "--port")):
-    """Stop the daemon."""
+    """Offload the warmed model but keep the daemon running."""
     serve_stop(port=port)
 
 
 @serve_app.command("status")
 def serve_status_cmd(port: int = Option(DEFAULT_PORT, "--port")):
-    """Show runtime status."""
+    """Show the loaded-model runtime status reported by the daemon."""
     serve_status(port=port)
 
 
@@ -345,7 +425,7 @@ def serve_options_cmd():
     serve_options()
 
 
-daemon_app = typer.Typer(help="Manage the local daemon.", no_args_is_help=True)
+daemon_app = typer.Typer(help="Manage the local background daemon process.", no_args_is_help=True)
 app.add_typer(daemon_app, name="daemon")
 
 
@@ -356,13 +436,13 @@ def daemon_start_cmd(
     detach: bool = Option(True, "--detach/--foreground"),
     log: Optional[str] = Option(None, "--log"),
 ):
-    """Start the daemon."""
+    """Start the daemon process."""
     daemon_start(host=host, port=port, detach=detach, log=log)
 
 
 @daemon_app.command("stop")
 def daemon_stop_cmd(port: int = Option(DEFAULT_PORT, "--port")):
-    """Stop the daemon."""
+    """Stop the daemon process."""
     daemon_stop(port=port)
 
 
@@ -371,7 +451,7 @@ def daemon_status_cmd(
     host: str = Option(DEFAULT_HOST, "--host"),
     port: int = Option(DEFAULT_PORT, "--port"),
 ):
-    """Show daemon status."""
+    """Show daemon process status."""
     daemon_status(host=host, port=port)
 
 

@@ -26,18 +26,27 @@ from textual.widgets.option_list import Option
 from local_llm import __version__
 from local_llm.config import (
     _default_generation_settings,
+    detect_output_size_profile,
     get_effective_profile,
     get_generation_settings,
+    get_output_size_profile,
     get_runtime_settings,
     get_session_defaults,
     get_tui_settings,
     load_config,
+    normalize_output_size_profile,
     save_config,
     save_generation_settings,
     save_runtime_settings,
     save_tui_settings,
 )
-from local_llm.constants import DEFAULT_SYSTEM_PROMPT, GENERATION_PRESETS, MODEL_METADATA, RECOMMENDED_MODELS
+from local_llm.constants import (
+    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    DEFAULT_SYSTEM_PROMPT,
+    GENERATION_PRESETS,
+    MODEL_METADATA,
+    RECOMMENDED_MODELS,
+)
 from local_llm.engine import Engine
 from local_llm.models import list_models
 from local_llm.tui.commands import CommandSpec, canonical_name, get_command, iter_commands
@@ -252,11 +261,16 @@ class CommandPalette(App):
     }
 
     #composer {
-        height: 4;
-        min-height: 3;
-        max-height: 6;
+        height: auto;
+        min-height: 1;
+        max-height: 8;
         border: round #22314d;
         background: #09101f;
+    }
+
+    #composer.-disabled {
+        border: round #161b22;
+        color: #484f58;
     }
 
     #composer-hints {
@@ -300,6 +314,11 @@ class CommandPalette(App):
     .summary-msg {
         color: #8ba0c2;
     }
+
+    .assistant-label {
+        color: #8ba0c2;
+        margin: 1 0 0 0;
+    }
     """
 
     BINDINGS = [
@@ -331,6 +350,7 @@ class CommandPalette(App):
         self._spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         self._spinner_idx = 0
         self._spinner_timer = None
+        self._thinking_label = "Working"
         self._drawer_entries: dict[str, dict] = {}
         self._runtime_snapshot: dict = {}
         self._snapshot_refresh_inflight = False
@@ -348,6 +368,7 @@ class CommandPalette(App):
         self.gen_system_prompt = DEFAULT_SYSTEM_PROMPT
         self.runtime_max_context: int | None = None
         self.runtime_keep_alive: int | None = None
+        self.runtime_request_timeout = DEFAULT_REQUEST_TIMEOUT_SECONDS
         self.runtime_safe = True
         self._profile_name = "auto"
 
@@ -385,21 +406,18 @@ class CommandPalette(App):
         self.gen_system_prompt = generation["system_prompt"]
         self.runtime_max_context = session_defaults.get("max_context")
         self.runtime_keep_alive = session_defaults.get("keep_alive_seconds")
+        self.runtime_request_timeout = int(runtime.get("request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS))
         self.runtime_safe = bool(runtime.get("safe_mode", True))
 
         self._history = HistoryStore(Path.cwd(), limit=int(self._tui_settings.get("history_size", 100)))
         self._custom_commands = discover_custom_commands()
 
         self.query_one("#composer", Composer).focus()
-        self.log_msg(f"[bold]local-llm v{__version__}[/] ready. Type [bold]/[/] for commands.", style="system-msg")
         self.log_msg(
-            "[dim]Ctrl+C cancel generation · Ctrl+D quit · Ctrl+J / Option+Enter newline · Esc Esc edit previous prompt[/]",
+            f"[bold]local-llm v{__version__}[/] ready — type [bold]/[/] for commands · [dim]Ctrl+C cancel · Ctrl+D quit · /help keys[/dim]",
             style="system-msg",
         )
-        self.log_msg(
-            "[dim]Slash commands are discoverable in the drawer. Old aliases like /select, /set, /serve, and /ps still work.[/]",
-            style="system-msg",
-        )
+        self.log_msg("[dim]─────────────────────────────────────────[/dim]", style="system-msg")
 
         running = self._engine.get_running_model() if self._engine else None
         if running:
@@ -429,6 +447,20 @@ class CommandPalette(App):
         log.mount(widget)
         log.scroll_end(animate=False)
 
+    def _log_user_msg(self, text: str) -> None:
+        log = self.query_one("#transcript", VerticalScroll)
+        panel = Static(
+            Panel(
+                Text(text),
+                title="[bold]You[/bold]",
+                title_align="left",
+                border_style="#58a6ff",
+                padding=(0, 1),
+            )
+        )
+        log.mount(panel)
+        log.scroll_end(animate=False)
+
     def action_clear_transcript(self) -> None:
         self.query_one("#transcript", VerticalScroll).remove_children()
         self.log_msg("Transcript cleared.", style="system-msg")
@@ -439,9 +471,9 @@ class CommandPalette(App):
             return
         try:
             subprocess.run(["pbcopy"], input=self._last_response.encode(), check=True)
-            self.log_msg("Copied last response to clipboard.", style="system-msg")
+            self.notify("Copied to clipboard", severity="information", timeout=2)
         except Exception as exc:
-            self.log_msg(f"Copy failed: {exc}", style="error-msg")
+            self.notify(f"Copy failed: {exc}", severity="error", timeout=3)
 
     def action_interrupt(self) -> None:
         if not self._generation_inflight:
@@ -471,7 +503,8 @@ class CommandPalette(App):
     def action_transcript_line_down(self) -> None:
         self.query_one("#transcript", VerticalScroll).scroll_down(animate=False)
 
-    def start_thinking(self) -> None:
+    def start_thinking(self, label: str = "Working") -> None:
+        self._thinking_label = label
         activity = self.query_one("#activity", Static)
         activity.add_class("-active")
         if self._spinner_timer is None:
@@ -483,10 +516,11 @@ class CommandPalette(App):
         if self._spinner_timer is not None:
             self._spinner_timer.pause()
             self._spinner_timer = None
+        self._thinking_label = "Working"
 
     def _update_spinner(self) -> None:
         self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_frames)
-        self.query_one("#activity", Static).update(f"{self._spinner_frames[self._spinner_idx]} Working…")
+        self.query_one("#activity", Static).update(f"{self._spinner_frames[self._spinner_idx]} {self._thinking_label}…")
 
     @property
     def composer(self) -> Composer:
@@ -563,8 +597,27 @@ class CommandPalette(App):
             action = args[0] if args else "start"
             target = args[1] if len(args) > 1 and not args[1].startswith("-") else (self.selected_model or "selected-model")
             if action == "start":
-                return f"[bold]/runtime[/] [dim]›[/] [bold]start[/] [cyan]{escape(target)}[/cyan]\n[dim]Press Enter to warm or restart the daemon runtime for this model.[/dim]"
+                return (
+                    f"[bold]/runtime[/] [dim]›[/] [bold]start[/] [cyan]{escape(target)}[/cyan]\n"
+                    "[dim]Press Enter to warm this model into the background daemon process.[/dim]"
+                )
+            if action == "stop":
+                return "[bold]/runtime[/] [dim]›[/] [bold]stop[/]\n[dim]Press Enter to offload the current model and keep the daemon process running.[/dim]"
+            if action == "status":
+                return "[bold]/runtime[/] [dim]›[/] [bold]status[/]\n[dim]Press Enter to inspect the loaded-model state inside the daemon process.[/dim]"
+            if action == "options":
+                return "[bold]/runtime[/] [dim]›[/] [bold]options[/]\n[dim]Press Enter to show runtime defaults for the daemon-managed model state.[/dim]"
             return f"[bold]/runtime[/] [dim]›[/] [bold]{escape(action)}[/]\n[dim]Press Enter to run this runtime action.[/dim]"
+
+        if command == "/daemon":
+            action = args[0] if args else "status"
+            if action == "start":
+                return "[bold]/daemon[/] [dim]›[/] [bold]start[/]\n[dim]Press Enter to start the background daemon process.[/dim]"
+            if action == "stop":
+                return "[bold]/daemon[/] [dim]›[/] [bold]stop[/]\n[dim]Press Enter to stop the daemon process itself.[/dim]"
+            if action == "status":
+                return "[bold]/daemon[/] [dim]›[/] [bold]status[/]\n[dim]Press Enter to inspect the daemon process and any loaded runtime state.[/dim]"
+            return f"[bold]/daemon[/] [dim]›[/] [bold]{escape(action)}[/]\n[dim]Press Enter to run this daemon action.[/dim]"
 
         if command == "/config":
             if not args:
@@ -607,9 +660,11 @@ class CommandPalette(App):
         if command == "/model":
             return "[dim]Model · Pick one installed model to make it the active chat target[/dim]"
         if command == "/runtime":
-            return "[dim]Runtime · Start uses the selected model by default; status and stop do not need extra input[/dim]"
+            return "[dim]Runtime = loaded model state inside the daemon. Start warms a model; stop offloads it; `daemon stop` kills the process.[/dim]"
+        if command == "/daemon":
+            return "[dim]Daemon = background process. Start/stop control the process itself; runtime commands only warm or offload models inside it.[/dim]"
         if command == "/config":
-            return "[dim]Config · Pick a setting, then enter its new value[/dim]"
+            return "[dim]Config · Use `size` for S/M/L/XL/XXL, or set `max_tokens` and `request_timeout` directly[/dim]"
         return "[dim]Slash mode · Enter executes when syntax is complete · Tab focuses suggestions[/dim]"
 
     def _statusline_value(self, field: str) -> str:
@@ -646,6 +701,10 @@ class CommandPalette(App):
     def _set_generation_inflight(self, active: bool) -> None:
         self._generation_inflight = active
         self.composer.disabled = active
+        if active:
+            self.composer.add_class("-disabled")
+        else:
+            self.composer.remove_class("-disabled")
         self._render_composer_hints()
         self._render_statusline()
 
@@ -820,7 +879,20 @@ class CommandPalette(App):
                 detail,
             ) for label, value, detail in suggestions if not remainder or label.startswith(remainder)]
         if spec.canonical == "/config":
-            settings = ["preset", "temp", "top_p", "top_k", "max_tokens", "max_context", "keep_alive", "safe", "system_prompt", "reset"]
+            settings = [
+                "preset",
+                "size",
+                "temp",
+                "top_p",
+                "top_k",
+                "max_tokens",
+                "request_timeout",
+                "max_context",
+                "keep_alive",
+                "safe",
+                "system_prompt",
+                "reset",
+            ]
             return [(
                 f"[cyan]{setting}[/cyan] [dim]- configure {setting}[/dim]",
                 f"/config {setting} ",
@@ -953,7 +1025,8 @@ class CommandPalette(App):
             self.composer.focus()
 
     def _show_drawer_detail(self, detail: str) -> None:
-        self.query_one("#drawer-details", Static).update(detail)
+        hint = "\n[dim]Enter select · Esc dismiss · Up/Down navigate[/dim]"
+        self.query_one("#drawer-details", Static).update(detail + hint)
 
     def action_focus_composer_command(self) -> None:
         self._focus_composer_command()
@@ -1015,6 +1088,8 @@ class CommandPalette(App):
         if drawer.has_class("-visible"):
             drawer.remove_class("-visible")
             self._render_composer_hints()
+        elif self._last_user_prompt:
+            self._render_composer_hints(error="Press Esc again to load previous prompt")
 
     def _load_previous_prompt(self) -> None:
         if not self._last_user_prompt:
@@ -1084,7 +1159,7 @@ class CommandPalette(App):
                 return
             self._last_user_prompt = raw
             self._set_generation_inflight(True)
-            self.log_msg(f"You: {escape(raw)}", style="user-msg")
+            self._log_user_msg(raw)
             self._handle_chat(raw)
 
     def _validate_command(self, command_line: str) -> str | None:
@@ -1116,11 +1191,19 @@ class CommandPalette(App):
             return "Select a model or pass one explicitly before starting the runtime."
         if canonical == "/config" and args:
             key = args[0]
+            if key == "size" and len(args) > 1:
+                if normalize_output_size_profile(args[1]) is None:
+                    return "size accepts S, M, L, XL, or XXL."
             if key in {"temp", "top_p"} and len(args) > 1:
                 try:
                     float(args[1])
                 except ValueError:
                     return f"{key} must be numeric."
+            if key == "request_timeout" and len(args) > 1:
+                try:
+                    int(args[1])
+                except ValueError:
+                    return "request_timeout must be an integer."
             if key in {"top_k", "max_tokens", "max_context", "keep_alive"} and len(args) > 1:
                 if args[1].lower() not in {"auto", "none", "reset", "default"}:
                     try:
@@ -1218,7 +1301,8 @@ class CommandPalette(App):
         elif command == "/clear":
             self._chat_history = []
             self._session_id = f"tui-{uuid.uuid4().hex[:8]}"
-            self.log_msg("Conversation history cleared. New session started.", style="system-msg")
+            self.log_msg("[dim]─────────────────────────────────────────[/dim]", style="system-msg")
+            self.log_msg("New session started.", style="system-msg")
             self._render_composer_header()
             self._render_statusline()
 
@@ -1236,7 +1320,7 @@ class CommandPalette(App):
         profile_override = custom.profile
         self._last_user_prompt = prompt
         self._set_generation_inflight(True)
-        self.log_msg(f"You: {escape(raw)}", style="user-msg")
+        self._log_user_msg(raw)
         self.log_msg(f"[dim]expanded → {escape(prompt)}[/dim]", style="system-msg")
         self._handle_chat(prompt, profile_override=profile_override, safe_override=safe_override)
 
@@ -1330,6 +1414,22 @@ class CommandPalette(App):
             self._persist_gen_settings()
             self.log_msg(f"Applied preset [bold]{value}[/].", style="system-msg")
             return
+        if key == "size":
+            profile_name = normalize_output_size_profile(value)
+            if profile_name is None:
+                self.log_msg("size accepts S, M, L, XL, or XXL.", style="error-msg")
+                return
+            profile = get_output_size_profile(profile_name)
+            assert profile is not None
+            self.gen_max_tokens = int(profile["max_tokens"])
+            self.runtime_request_timeout = int(profile["request_timeout_seconds"])
+            self._persist_gen_settings()
+            self._persist_runtime_settings()
+            self.log_msg(
+                f"Applied size [bold]{profile_name}[/] → max_tokens={self.gen_max_tokens} request_timeout={self.runtime_request_timeout}s",
+                style="system-msg",
+            )
+            return
         if key == "reset":
             defaults = _default_generation_settings()
             self.gen_preset = defaults["preset"]
@@ -1340,6 +1440,7 @@ class CommandPalette(App):
             self.gen_system_prompt = defaults["system_prompt"]
             self.runtime_max_context = None
             self.runtime_keep_alive = None
+            self.runtime_request_timeout = DEFAULT_REQUEST_TIMEOUT_SECONDS
             self.runtime_safe = True
             self._persist_gen_settings()
             self._persist_runtime_settings()
@@ -1367,6 +1468,12 @@ class CommandPalette(App):
                 self.gen_top_k = int(value)
             elif key == "max_tokens":
                 self.gen_max_tokens = int(value)
+            elif key == "request_timeout":
+                self.runtime_request_timeout = int(value)
+                self._persist_runtime_settings()
+                self.log_msg(f"request_timeout → {self.runtime_request_timeout}s", style="system-msg")
+                self._render_statusline()
+                return
             elif key == "max_context":
                 self.runtime_max_context = None if value.lower() in {"auto", "none", "reset", "default"} else int(value)
                 self._persist_session_defaults()
@@ -1398,11 +1505,14 @@ class CommandPalette(App):
         lines = [
             "[bold]Current Config[/]",
             f"preset={self.gen_preset}  temp={self.gen_temp}  top_p={self.gen_top_p}  top_k={self.gen_top_k}",
-            f"max_tokens={self.gen_max_tokens}  max_context={self.runtime_max_context or 'auto'}  keep_alive={self.runtime_keep_alive or 'auto'}  safe={'on' if self.runtime_safe else 'off'}",
+            f"size={detect_output_size_profile(self.gen_max_tokens, self.runtime_request_timeout) or 'custom'}  max_tokens={self.gen_max_tokens}  request_timeout={self.runtime_request_timeout}s",
+            f"max_context={self.runtime_max_context or 'auto'}  keep_alive={self.runtime_keep_alive or 'auto'}  safe={'on' if self.runtime_safe else 'off'}",
             f"system_prompt={escape(self.gen_system_prompt)}",
             "",
             "[dim]Examples[/dim]",
             "  /config preset balanced",
+            "  /config size XL",
+            "  /config request_timeout 900",
             "  /config max_context 8192",
             "  /config safe off",
             "  /config system_prompt You are a concise coding assistant.",
@@ -1434,7 +1544,7 @@ class CommandPalette(App):
     def _show_status_panel(self) -> None:
         snapshot = self._runtime_snapshot or {}
         lines = [
-            "[bold]Runtime Snapshot[/]",
+            "[bold]Runtime Snapshot (loaded model state)[/]",
             f"state={snapshot.get('status', 'offline')}",
             f"model={snapshot.get('loaded_model') or 'none'}",
             f"profile={snapshot.get('profile') or self._profile_name}",
@@ -1442,12 +1552,16 @@ class CommandPalette(App):
             f"queue={snapshot.get('queue_depth', 0)}",
             f"memory={snapshot.get('memory_pressure', {}).get('state', 'unknown')}",
             f"keep_alive={snapshot.get('keep_alive_seconds', self.runtime_keep_alive)}",
+            f"request_timeout={snapshot.get('request_timeout_seconds', self.runtime_request_timeout)}",
         ]
         self.log_msg("\n".join(lines), style="system-msg")
 
     def _show_help(self, subject: str | None = None) -> None:
         if subject in {None, "", "commands"}:
-            lines = ["[bold]Commands[/]"]
+            lines = [
+                "[bold]Commands[/]",
+                "[dim]Daemon = background process. Runtime = loaded model state managed inside that process.[/dim]",
+            ]
             categories: dict[str, list[CommandSpec]] = {}
             for spec in iter_commands():
                 categories.setdefault(spec.category, []).append(spec)
@@ -1508,7 +1622,12 @@ class CommandPalette(App):
         )
 
     def _persist_runtime_settings(self) -> None:
-        save_runtime_settings({"safe_mode": self.runtime_safe})
+        save_runtime_settings(
+            {
+                "safe_mode": self.runtime_safe,
+                "request_timeout_seconds": self.runtime_request_timeout,
+            }
+        )
 
     def _persist_session_defaults(self) -> None:
         config = load_config()
@@ -1523,7 +1642,7 @@ class CommandPalette(App):
     def _run_cli_command(self, args: list[str]) -> None:
         import sys
 
-        self.call_from_thread(self.start_thinking)
+        self.call_from_thread(self.start_thinking, f"Running /{args[0]}" if args else "Working")
         try:
             result = subprocess.run(
                 [sys.executable, "-m", "local_llm.cli"] + args,
@@ -1579,7 +1698,9 @@ class CommandPalette(App):
 
     def _create_stream_widget(self, widget_id: str) -> None:
         log = self.query_one("#transcript", VerticalScroll)
+        label = Static("[dim bold]Assistant[/dim bold]", classes="assistant-label")
         widget = Static("", id=widget_id, markup=False)
+        log.mount(label)
         log.mount(widget)
         log.scroll_end(animate=False)
 
@@ -1611,7 +1732,7 @@ class CommandPalette(App):
     def _ensure_server_for_model(self, model: str) -> None:
         if not self._engine:
             return
-        self.call_from_thread(self.start_thinking)
+        self.call_from_thread(self.start_thinking, "Warming model")
         try:
             self._engine.ensure_server(
                 model,
@@ -1654,7 +1775,7 @@ class CommandPalette(App):
             return
 
         safe_value = self.runtime_safe if safe_override is None else safe_override
-        self.call_from_thread(self.start_thinking)
+        self.call_from_thread(self.start_thinking, "Generating")
 
         widget_id = f"stream-{uuid.uuid4().hex}"
         self.call_from_thread(self._create_stream_widget, widget_id)
@@ -1676,6 +1797,7 @@ class CommandPalette(App):
             messages = [{"role": "system", "content": self.gen_system_prompt}, *self._chat_history]
 
             full_text = ""
+            last_render = 0.0
             for chunk in self._engine.chat_stream(
                 messages,
                 temperature=self.gen_temp,
@@ -1689,8 +1811,10 @@ class CommandPalette(App):
                 safe=safe_value,
             ):
                 full_text += chunk
-                if len(full_text) % 24 == 0 or chunk.endswith(("\n", ".", "!", "?")):
+                now = time.monotonic()
+                if now - last_render >= 0.05 or chunk.endswith(("\n", ".", "!", "?")):
                     self.call_from_thread(self._update_stream_widget, widget_id, full_text)
+                    last_render = now
 
             cleaned = re.sub(r"<think>.*?(</think>|$)", "", full_text, flags=re.DOTALL).strip()
             self._last_response = cleaned

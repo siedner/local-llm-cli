@@ -120,6 +120,84 @@ def test_models_install_command_context_shows_waiting_for_repo():
     asyncio.run(run())
 
 
+def test_runtime_hint_explains_runtime_vs_daemon():
+    async def run() -> None:
+        with patch("local_llm.tui.app._cached_list_models", return_value=[]), \
+             patch("local_llm.tui.app.discover_custom_commands", return_value={}):
+            app = CommandPalette()
+            async with app.run_test() as pilot:
+                app._set_composer_text("/runtime ")
+                await pilot.pause()
+                hint = app._command_hint_message()
+                assert "Runtime = loaded model state inside the daemon" in hint
+                assert "`daemon stop` kills the process" in hint
+
+    asyncio.run(run())
+
+
+def test_runtime_stop_context_mentions_offload_not_process_stop():
+    async def run() -> None:
+        with patch("local_llm.tui.app._cached_list_models", return_value=[]), \
+             patch("local_llm.tui.app.discover_custom_commands", return_value={}):
+            app = CommandPalette()
+            async with app.run_test() as pilot:
+                app._set_composer_text("/runtime stop")
+                await pilot.pause()
+                context = app._command_context_markup()
+                assert "offload the current model" in context
+                assert "keep the daemon process running" in context
+
+    asyncio.run(run())
+
+
+def test_daemon_hint_explains_process_control():
+    async def run() -> None:
+        with patch("local_llm.tui.app._cached_list_models", return_value=[]), \
+             patch("local_llm.tui.app.discover_custom_commands", return_value={}):
+            app = CommandPalette()
+            async with app.run_test() as pilot:
+                app._set_composer_text("/daemon ")
+                await pilot.pause()
+                hint = app._command_hint_message()
+                assert "Daemon = background process" in hint
+                assert "runtime commands only warm or offload models inside it" in hint
+
+    asyncio.run(run())
+
+
+def test_config_size_profile_updates_max_tokens_and_timeout(tmp_path):
+    async def run() -> None:
+        config_file = tmp_path / "config.json"
+        with patch("local_llm.tui.app._cached_list_models", return_value=[]), \
+             patch("local_llm.tui.app.discover_custom_commands", return_value={}), \
+             patch("local_llm.config.CONFIG_FILE", config_file), \
+             patch("local_llm.config.CONFIG_DIR", tmp_path):
+            app = CommandPalette()
+            async with app.run_test() as pilot:
+                app._handle_command("/config size XL")
+                await pilot.pause()
+                assert app.gen_max_tokens == 3072
+                assert app.runtime_request_timeout == 900
+
+    asyncio.run(run())
+
+
+def test_config_request_timeout_updates_runtime_setting(tmp_path):
+    async def run() -> None:
+        config_file = tmp_path / "config.json"
+        with patch("local_llm.tui.app._cached_list_models", return_value=[]), \
+             patch("local_llm.tui.app.discover_custom_commands", return_value={}), \
+             patch("local_llm.config.CONFIG_FILE", config_file), \
+             patch("local_llm.config.CONFIG_DIR", tmp_path):
+            app = CommandPalette()
+            async with app.run_test() as pilot:
+                app._handle_command("/config request_timeout 900")
+                await pilot.pause()
+                assert app.runtime_request_timeout == 900
+
+    asyncio.run(run())
+
+
 def test_models_install_requires_explicit_repo():
     async def run() -> None:
         with patch("local_llm.tui.app._cached_list_models", return_value=[]), \

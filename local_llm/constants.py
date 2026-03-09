@@ -165,6 +165,34 @@ MODEL_METADATA = {
 
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 
+OUTPUT_SIZE_PROFILES = {
+    "S": {
+        "max_tokens": 512,
+        "request_timeout_seconds": 180,
+        "description": "Short replies and quick tool-style answers",
+    },
+    "M": {
+        "max_tokens": 1024,
+        "request_timeout_seconds": 300,
+        "description": "Default chat-sized answers",
+    },
+    "L": {
+        "max_tokens": 2048,
+        "request_timeout_seconds": 600,
+        "description": "Long code blocks or multi-part answers",
+    },
+    "XL": {
+        "max_tokens": 3072,
+        "request_timeout_seconds": 900,
+        "description": "Large coding tasks that need more room",
+    },
+    "XXL": {
+        "max_tokens": 4096,
+        "request_timeout_seconds": 1200,
+        "description": "Very long generations; slower and higher risk",
+    },
+}
+
 GENERATION_PRESETS = {
     "precise": {
         "description": "Factual, deterministic responses",

@@ -101,6 +101,25 @@ local-llm chat RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4 --temp 0.5 --top-p 0.95
 local-llm chat RepublicOfKorokke/Qwen3.5-4B-mlx-lm-mxfp4 --session repo-chat --max-context 4096
 ```
 
+Tune output length and timeout without editing config files:
+
+```bash
+local-llm config show
+local-llm config size L
+local-llm config max-tokens 4096
+local-llm config request-timeout 900
+```
+
+Size profiles:
+
+```text
+S   = 512 tokens / 180s
+M   = 1024 tokens / 300s
+L   = 2048 tokens / 600s
+XL  = 3072 tokens / 900s
+XXL = 4096 tokens / 1200s
+```
+
 ### Serve
 
 Start the local daemon and warm a model:
@@ -145,12 +164,20 @@ Warm path: reused
 
 Manage the daemon:
 ```bash
-local-llm serve status              # check if server is running
-local-llm serve stop                # stop the daemon on the default port
+local-llm serve status              # inspect loaded-model runtime state
+local-llm serve stop                # offload the current model, keep the daemon alive
+local-llm daemon status             # inspect the daemon process itself
+local-llm daemon stop               # stop the daemon process
 local-llm daemon start              # start daemon explicitly
 local-llm daemon install-launchd    # start at login via launchd
 local-llm serve options             # show runtime defaults and safe operating model
 local-llm logs --follow             # tail daemon logs
+```
+
+Terminology:
+```text
+daemon  = the background Python process listening on the port
+runtime = the loaded model state managed inside that daemon
 ```
 
 ### OpenCode Integration

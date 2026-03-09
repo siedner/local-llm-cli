@@ -9,10 +9,16 @@ import pytest
 
 from local_llm.config import (
     _default_config,
+    detect_output_size_profile,
     detect_profile,
     get_effective_profile,
+    get_output_size_profile,
+    get_runtime_settings,
     load_config,
     match_profile,
+    normalize_output_size_profile,
+    save_generation_settings,
+    save_runtime_settings,
     get_tui_settings,
     save_config,
     save_tui_settings,
@@ -91,6 +97,30 @@ def test_save_tui_settings(tmp_path):
         assert settings["show_statusline"] is False
 
 
+def test_save_generation_settings_preserves_unspecified_values(tmp_path):
+    config_file = tmp_path / "config.json"
+    with patch("local_llm.config.CONFIG_FILE", config_file), \
+         patch("local_llm.config.CONFIG_DIR", tmp_path):
+        save_config({"generation": {"system_prompt": "Keep this", "temp": 0.2}})
+        save_generation_settings({"max_tokens": 4096})
+        config = load_config()
+        assert config["generation"]["max_tokens"] == 4096
+        assert config["generation"]["system_prompt"] == "Keep this"
+        assert config["generation"]["temp"] == 0.2
+
+
+def test_save_runtime_settings_preserves_unspecified_values(tmp_path):
+    config_file = tmp_path / "config.json"
+    with patch("local_llm.config.CONFIG_FILE", config_file), \
+         patch("local_llm.config.CONFIG_DIR", tmp_path):
+        save_config({"runtime": {"host": "0.0.0.0", "safe_mode": False}})
+        save_runtime_settings({"request_timeout_seconds": 900})
+        runtime = get_runtime_settings()
+        assert runtime["request_timeout_seconds"] == 900
+        assert runtime["host"] == "0.0.0.0"
+        assert runtime["safe_mode"] is False
+
+
 def test_effective_profile_prefers_user_session_defaults_over_calibration():
     config = _default_config()
     config["profile"] = "m1pro32"
@@ -111,6 +141,16 @@ def test_effective_profile_prefers_user_session_defaults_over_calibration():
     assert name == "m1pro32"
     assert profile["default_context"] == 4096
     assert profile["keep_alive_seconds"] == 300
+
+
+def test_output_size_profile_helpers():
+    assert normalize_output_size_profile("xl") == "XL"
+    profile = get_output_size_profile("XL")
+    assert profile is not None
+    assert profile["max_tokens"] == 3072
+    assert profile["request_timeout_seconds"] == 900
+    assert detect_output_size_profile(3072, 900) == "XL"
+    assert detect_output_size_profile(1234, 900) is None
 
 
 def test_match_profile_m1pro32():

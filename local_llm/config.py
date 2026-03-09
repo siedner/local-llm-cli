@@ -20,6 +20,7 @@ from .constants import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_SYSTEM_PROMPT,
     GENERATION_PRESETS,
+    OUTPUT_SIZE_PROFILES,
     PROFILES,
 )
 
@@ -193,6 +194,7 @@ def save_generation_settings(settings: dict) -> None:
     config = load_config()
     config["generation"] = {
         **_default_generation_settings(),
+        **config.get("generation", {}),
         **settings,
     }
     save_config(config)
@@ -210,6 +212,7 @@ def save_runtime_settings(settings: dict) -> None:
     config = load_config()
     config["runtime"] = {
         **_default_runtime_settings(),
+        **config.get("runtime", {}),
         **settings,
     }
     save_config(config)
@@ -220,6 +223,33 @@ def get_session_defaults(config: dict | None = None) -> dict:
     if config is None:
         config = load_config()
     return {**_default_session_defaults(), **config.get("session_defaults", {})}
+
+
+def normalize_output_size_profile(name: str | None) -> str | None:
+    """Normalize a user-provided output size profile label."""
+    if not name:
+        return None
+    normalized = str(name).strip().upper()
+    return normalized if normalized in OUTPUT_SIZE_PROFILES else None
+
+
+def get_output_size_profile(name: str | None) -> dict | None:
+    """Return the output size profile payload for a label."""
+    normalized = normalize_output_size_profile(name)
+    if normalized is None:
+        return None
+    return {"name": normalized, **OUTPUT_SIZE_PROFILES[normalized]}
+
+
+def detect_output_size_profile(max_tokens: int, request_timeout_seconds: int) -> str | None:
+    """Return the matching output size profile label, if any."""
+    for name, profile in OUTPUT_SIZE_PROFILES.items():
+        if (
+            int(profile["max_tokens"]) == int(max_tokens)
+            and int(profile["request_timeout_seconds"]) == int(request_timeout_seconds)
+        ):
+            return name
+    return None
 
 
 def record_benchmark(result: dict) -> None:
